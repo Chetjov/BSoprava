@@ -1,0 +1,16 @@
+# ~/.config/systemd/user/voicenotes-worker.timer
+# systemctl --user enable --now voicenotes-worker.timer
+[Unit]
+Description=Pravidelné vybírání fronty hlasových poznámek
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+# Doběhne, co zameškal notebook ve spánku.
+Persistent=true
+AccuracySec=30s
+RandomizedDelaySec=15s
+Unit=voicenotes-worker.service
+
+[Install]
+WantedBy=timers.target

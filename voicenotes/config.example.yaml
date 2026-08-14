@@ -1,0 +1,70 @@
+# voicenotes — jeden config pro obě strany.
+# Na Pi se čte sekce `gateway:`, na notebooku `worker:`.
+# Tajemství tady nejsou: v souboru je jen jméno proměnné prostředí.
+
+gateway:
+  # Kořen fronty. queue/, .tmp/, archive/ a archive/rejected/ vzniknou uvnitř
+  # a musí zůstat na jednom svazku — jinak přesun z .tmp/ není atomický.
+  root: /srv/voicenotes
+
+  # Adresa tailscale rozhraní, NE 0.0.0.0.
+  # `tailscale` = zjistit za běhu přes `tailscale ip -4`.
+  host: tailscale
+  port: 8080
+
+  max_upload_mb: 25
+
+  # Proměnná prostředí se sdíleným tokenem (hlavička X-Auth-Token).
+  # Bez ní gateway nenastartuje.
+  auth_token_env: VOICENOTES_TOKEN
+
+  # Pojistka proti překlepu — poslech na všech rozhraních musíš povolit ručně.
+  allow_public_bind: false
+
+worker:
+  remote:
+    kind: ssh # ssh | local (local = fronta je složka na tomtéž stroji)
+    host: pi-voicenotes # tailscale MagicDNS jméno nebo adresa
+    user: voicenotes
+    port: 22
+    identity_file: ~/.ssh/id_ed25519_voicenotes
+    root: /srv/voicenotes
+    # Prefix cesty k audiu ve frontmatteru: `pi:/srv/voicenotes/archive/...`
+    label: pi
+    connect_timeout_s: 10
+    transfer_timeout_s: 300
+
+  # Pracovní adresář workeru: stažená fronta + evidence zpracovaného.
+  work_dir: ~/.local/share/voicenotes
+
+  vault:
+    root: ~/Obsidian/MujVault
+    inbox: Inbox
+    # Rozepsané poznámky; přidej do .stignore, ať to nesynchronizuje Syncthing.
+    staging_dirname: .voicenotes-tmp
+
+  # Časová zóna, ve které Pi razítkuje názvy souborů — worker z ní skládá
+  # `created:` ve frontmatteru.
+  timezone: Europe/Prague
+
+  # Volitelné cesty k nástrojům, když nejsou v PATH.
+  ffprobe_path: ffprobe
+  rsync_path: rsync
+  ssh_path: ssh
+# --- fáze 2 a 3 (zatím se nečte) ---------------------------------------
+#
+#   transcribe:
+#     model: large-v3
+#     language: cs
+#     vad: true
+#     initial_prompt_terms: [Obsidian, Tailscale, Syncthing]
+#
+#   structure:
+#     backend: ollama            # ollama | anthropic
+#     tags: [napad, ukol, poznamka, otazka, prace, osobni]
+#     ollama:
+#       model: qwen3:8b
+#       host: http://127.0.0.1:11434
+#     anthropic:
+#       model: claude-sonnet-5
+#       api_key_env: ANTHROPIC_API_KEY

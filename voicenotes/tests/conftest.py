@@ -1,0 +1,111 @@
+from __future__ import annotations
+
+import hashlib
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+import pytest
+import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from voicenotes.config import load_gateway_config, load_worker_config  # noqa: E402
+
+TOKEN = "test-token-123"
+#: Malý limit, ať se velké soubory netestují velkými soubory.
+MAX_UPLOAD_MB = 0.01
+MAX_UPLOAD_BYTES = int(MAX_UPLOAD_MB * 1024 * 1024)
+
+
+@dataclass
+class Env:
+    """Celá pipeline na jednom disku: 'Pi' i vault jsou jen adresáře."""
+
+    config_path: Path
+    pi_root: Path
+    vault_root: Path
+    work_dir: Path
+
+    @property
+    def gateway(self):
+        return load_gateway_config(self.config_path)
+
+    @property
+    def worker(self):
+        return load_worker_config(self.config_path)
+
+    @property
+    def queue_dir(self) -> Path:
+        return self.pi_root / "queue"
+
+    @property
+    def archive_dir(self) -> Path:
+        return self.pi_root / "archive"
+
+    @property
+    def inbox(self) -> Path:
+        return self.vault_root / "Inbox"
+
+    def notes(self) -> list[Path]:
+        return sorted(p for p in self.inbox.glob("*.md")) if self.inbox.is_dir() else []
+
+
+@pytest.fixture
+def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Env:
+    pi_root = tmp_path / "pi" / "voicenotes"
+    vault_root = tmp_path / "vault"
+    work_dir = tmp_path / "work"
+    vault_root.mkdir(parents=True)  # vault existuje vždycky, pipeline ho nezakládá
+
+    config = {
+        "gateway": {
+            "root": str(pi_root),
+            "host": "127.0.0.1",
+            "port": 8080,
+            "max_upload_mb": MAX_UPLOAD_MB,
+            "auth_token_env": "VOICENOTES_TOKEN",
+        },
+        "worker": {
+            "remote": {"kind": "local", "root": str(pi_root), "label": "pi"},
+            "work_dir": str(work_dir),
+            "vault": {"root": str(vault_root), "inbox": "Inbox"},
+            "timezone": "Europe/Prague",
+            # ffprobe v CI není; ať se netestuje na jeho přítomnosti.
+            "ffprobe_path": "ffprobe-neexistuje",
+        },
+    }
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    monkeypatch.setenv("VOICENOTES_TOKEN", TOKEN)
+    monkeypatch.setenv("VOICENOTES_CONFIG", str(config_path))
+    return Env(config_path, pi_root, vault_root, work_dir)
+
+
+@pytest.fixture
+def client(env: Env):
+    from fastapi.testclient import TestClient
+
+    from voicenotes.gateway import create_app
+
+    with TestClient(create_app(env.gateway)) as test_client:
+        yield test_client
+
+
+def audio_bytes(seed: bytes = b"nahravka", size: int = 2048) -> bytes:
+    """Deterministický 'zvuk' — jde o bajty, ne o obsah."""
+    out = bytearray()
+    block = hashlib.sha256(seed).digest()
+    while len(out) < size:
+        out.extend(block)
+        block = hashlib.sha256(block).digest()
+    return bytes(out[:size])
+
+
+def upload(client, data: bytes, *, token: str = TOKEN, filename: str = "rec.m4a"):
+    return client.post(
+        "/ingest",
+        headers={"X-Auth-Token": token},
+        files={"audio": (filename, data, "audio/m4a")},
+    )

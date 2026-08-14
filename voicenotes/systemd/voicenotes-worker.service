@@ -1,0 +1,13 @@
+# Uživatelská unit na notebooku: ~/.config/systemd/user/voicenotes-worker.service
+# Uživatelská proto, že vault i SSH klíč jsou v $HOME.
+[Unit]
+Description=voicenotes worker (jeden průchod fronty)
+Documentation=https://github.com/chetjov/BSoprava/tree/main/voicenotes
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=VOICENOTES_CONFIG=%h/.config/voicenotes/config.yaml
+ExecStart=%h/.local/share/voicenotes/venv/bin/voicenotes-worker
+# Prázdná fronta i vypnuté Pi končí nulou — v žurnálu nic nesvítí.
+TimeoutStartSec=30min

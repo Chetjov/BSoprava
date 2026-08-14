@@ -1,0 +1,30 @@
+# Systémová unit na Pi 4: sudo cp systemd/voicenotes-gateway.service /etc/systemd/system/
+# Token patří do /etc/voicenotes/gateway.env (chmod 600), ne sem.
+[Unit]
+Description=voicenotes gateway (příjem hlasových poznámek)
+Documentation=https://github.com/chetjov/BSoprava/tree/main/voicenotes
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=voicenotes
+Group=voicenotes
+Environment=VOICENOTES_CONFIG=/etc/voicenotes/config.yaml
+EnvironmentFile=/etc/voicenotes/gateway.env
+ExecStart=/opt/voicenotes/venv/bin/voicenotes-gateway
+# Tailscale rozhraní nemusí být při startu hotové; bind selže a zkusí se znovu.
+Restart=always
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/srv/voicenotes
+
+[Install]
+WantedBy=multi-user.target
