@@ -22,13 +22,15 @@ zapnutý. Když je vypnutý, fronta na Pi se plní a worker to dožene.
 | Fáze | Obsah | Stav |
 |---|---|---|
 | 1 | Transport: gateway, worker, poznámka s placeholderem | **hotovo** |
-| 2 | Přepis (faster-whisper, VAD, chybové stavy) | čeká |
+| 2 | Přepis (faster-whisper, VAD, chybové stavy) | **hotovo** |
 | 3 | Strukturování (ollama / anthropic, uzavřené tagy) | čeká |
 | 4 | Benchmark modelů + týdenní review skript | čeká |
 
-Fáze 1 je celá cesta telefon → vault bez modelů. Poznámka vznikne s
-`status: needs-review` a placeholderem místo přepisu — jde o ověření
-transportu, ne o užitečný obsah.
+Poznámka teď obsahuje surový přepis a titulek z prvních slov. Shrnutí, tagy
+a úkoly přijdou ve fázi 3; do té doby zůstává `tags: []`.
+
+Přepis jde vypnout (`worker.transcribe.enabled: false`) — worker pak vyrobí
+poznámku s placeholderem. Hodí se na ověření transportu bez čekání na model.
 
 ## Instalace — Pi 4 (gateway)
 
@@ -108,6 +110,36 @@ journalctl --user -u voicenotes-worker -f
 Notebook běží nárazově — `Persistent=true` v timeru zajistí, že se po probuzení
 zameškaný běh dožene.
 
+## Přepis
+
+`faster-whisper`, model `large-v3`. Váhy se stáhnou při prvním běhu
+(~3 GB do `~/.cache/huggingface`, jinam přes `transcribe.download_root`).
+Dekóduje se přes PyAV, takže ffmpeg v PATH být nemusí. Pro GPU je potřeba
+CUDA runtime a cuDNN — ty pip neinstaluje, viz
+[dokumentace faster-whisper](https://github.com/SYSTRAN/faster-whisper#gpu).
+Bez GPU stačí `device: cpu` a `compute_type: int8`.
+
+Tři věci jsou nastavené natvrdo z konkrétních důvodů a stojí za to je při
+ladění nechat být:
+
+- **`language: cs` explicitně.** Autodetekce u krátkých nahrávek přepne na
+  slovenštinu.
+- **VAD zapnutý.** Bez něj model v tichých pasážích halucinuje opakující se
+  nesmysly, což je u nahrávek z venku běžné. Nahrávka, ve které VAD nenajde
+  řeč (spuštění v kapse), jde do `archive/rejected/` a poznámka nevzniká.
+- **`condition_on_previous_text: false`.** Brání zacyklení na jedné frázi.
+
+`initial_prompt_terms` je slovníček jmen a termínů, které model bez nápovědy
+komolí. Skládá se z něj jedna věta, kterou dostane model na vstupu; celou
+nápovědu jde přepsat ručně přes `initial_prompt`.
+
+Model se načítá až u první nahrávky — prázdná fronta na disk nesáhne — a po
+skončení běhu se uvolní z paměti. Na 6 GB VRAM se whisper a strukturovací
+model nevejdou zároveň, což bude podstatné ve fázi 3.
+
+Ruční přepis jedné nahrávky (třeba po `needs-review`) zatím není zabalený do
+příkazu; audio zůstává v `archive/` na Pi, takže jde pustit whisper napřímo.
+
 ## Syncthing
 
 Pipeline **jen vytváří nové soubory, nikdy needituje existující** — jinak by
@@ -132,12 +164,21 @@ Audio ve vaultu není a nebude; ve frontmatteru je jen cesta na Pi.
 | Nahrávka už zpracovaná | Gateway ji nevrátí do fronty, worker ji přeskočí podle evidence |
 | Pi nedostupné | Worker skončí tiše, zkusí to příští běh |
 | Přerušený přenos | Hash nesedí na název → poznámka nevznikne, originál zůstává na Pi |
+| VAD nenajde řeč | Do `archive/rejected/`, poznámka nevzniká, log |
+| Přepis selže | Poznámka **vznikne** se `status: needs-review` a chybou v těle |
+| Model se nenačte | Běh se zastaví nenulovým kódem, fronta zůstane nedotčená |
 | Cílová poznámka existuje | Přidá se suffix `-2`, existující soubor se nikdy nepřepíše |
 | Zápis poznámky selže | Nahrávka zůstává ve frontě, další běh to zkusí znovu |
 | Dva běhy najednou | Druhý zjistí zámek a skončí |
 
 Nahrávka se z fronty na Pi jen přesouvá do `archive/`, nikdy nemaže. Lokální
 kopie na notebooku se po zpracování uklidí.
+
+Selhání přepisu a selhání načtení modelu se schválně řeší jinak. Jedna vadná
+nahrávka dá jednu poznámku s chybou; nefunkční model by dal poznámku s chybou
+ke *každé* nahrávce ve frontě — a protože pipeline soubory ve vaultu needituje
+ani nemaže, byl by to ruční úklid. Proto se v tom případě běh zastaví a fronta
+zůstane, kde byla.
 
 ## Konfigurace
 
@@ -201,8 +242,14 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev,gateway]'
 ```
 
 Testy jsou vážené na chybové stavy: atomický zápis, idempotence hashe, kolize
-názvů, špatný token, limit velikosti, nedostupné Pi, souběžné běhy. Happy path
-je jeden, přes celou cestu od uploadu po soubor ve vaultu.
+názvů, špatný token, limit velikosti, nedostupné Pi, souběžné běhy, prázdná
+nahrávka, selhání přepisu, nenačtený model. Happy path je jeden, přes celou
+cestu od uploadu po soubor ve vaultu.
+
+Přepis se v testech nahrazuje falešným modelem, takže suita běží bez CUDA i bez
+stažených vah. Aby se překlep v parametru nedozvěděl až notebook, dva testy
+porovnávají použité parametry se skutečnými podpisy `faster_whisper`
+(přeskočí se, když knihovna není nainstalovaná).
 
 ## Struktura
 
@@ -212,12 +259,13 @@ voicenotes/
 ├── ids.py         název souboru = timestamp + hash obsahu (sdílí obě strany)
 ├── gateway.py     celý HTTP endpoint pro Pi
 └── worker/
-    ├── run.py     hlavní běh: stáhnout, zpracovat, uklidit
-    ├── remote.py  fronta na Pi přes rsync/ssh (+ lokální varianta pro testy)
-    ├── vault.py   zápis do vaultu — jen nové soubory, atomicky
-    ├── notes.py   tvar markdown poznámky a frontmatteru
-    ├── ledger.py  evidence zpracovaného (append-only JSONL, ne databáze)
-    └── audio.py   délka nahrávky přes ffprobe
+    ├── run.py        hlavní běh: stáhnout, přepsat, zapsat, uklidit
+    ├── remote.py     fronta na Pi přes rsync/ssh (+ lokální varianta pro testy)
+    ├── transcribe.py faster-whisper za rozhraním, které jde v testech nahradit
+    ├── vault.py      zápis do vaultu — jen nové soubory, atomicky
+    ├── notes.py      tvar markdown poznámky a frontmatteru
+    ├── ledger.py     evidence zpracovaného (append-only JSONL, ne databáze)
+    └── audio.py      délka nahrávky přes ffprobe
 ```
 
 Gateway je jeden soubor podle zadání; sdílí s workerem jen `config.py` a

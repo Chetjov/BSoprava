@@ -6,12 +6,17 @@ aby se fáze 2 a 3 přidávaly doplněním polí, ne přepisem šablony.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
 STATUS_INBOX = "inbox"
 STATUS_NEEDS_REVIEW = "needs-review"
+#: Jen do evidence — k zahozené nahrávce poznámka nevzniká.
+STATUS_REJECTED = "rejected"
+
+FALLBACK_TITLE = "Nahrávka bez titulku"
 
 #: Znaky, po kterých už plain scalar v YAML není bezpečný.
 _UNSAFE_START = set("-?:,[]{}#&*!|>'\"%@`")
@@ -58,6 +63,32 @@ def dump_frontmatter(fields: dict[str, Any]) -> str:
             lines.append(f"{key}: {yaml_scalar(value)}")
     lines.append("---")
     return "\n".join(lines)
+
+
+def title_from_transcript(text: str, *, max_words: int = 8, max_chars: int = 70) -> str:
+    """Nouzový titulek z prvních slov přepisu.
+
+    Používá se, dokud (nebo když) nefunguje strukturování. Není to hezké,
+    ale je to lepší než časová značka — podle titulku se rozhoduju, jestli
+    poznámku vůbec otevřu.
+    """
+    if not text.strip():
+        return FALLBACK_TITLE
+    # Whisper interpunkci doplňuje, tak je první věta lepší hranice než
+    # počet slov — jinak titulek končí uprostřed myšlenky ("...padá to na").
+    sentence = re.split(r"(?<=[.!?…])\s", text.strip(), maxsplit=1)[0]
+    if len(sentence.split()) < 3:
+        sentence = text.strip()
+    words = sentence.split()
+    if not words:
+        return FALLBACK_TITLE
+    title = " ".join(words[:max_words])
+    if len(title) > max_chars:
+        title = title[:max_chars].rsplit(" ", 1)[0] or title[:max_chars]
+    title = title.strip(" .,;:!?-–—…")
+    if not title:
+        return FALLBACK_TITLE
+    return title[0].upper() + title[1:]
 
 
 @dataclass

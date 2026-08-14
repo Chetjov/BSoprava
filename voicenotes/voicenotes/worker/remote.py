@@ -36,6 +36,10 @@ class RemoteQueue(ABC):
     def archive(self, name: str) -> bool:
         """Přesune `queue/<name>` do `archive/<name>`. Nikdy nemaže."""
 
+    @abstractmethod
+    def reject(self, name: str) -> bool:
+        """Přesune nahrávku bez řeči do `archive/rejected/<name>`."""
+
 
 class SshRemoteQueue(RemoteQueue):
     def __init__(
@@ -78,10 +82,11 @@ class SshRemoteQueue(RemoteQueue):
             f"{destination}/",
         ]
 
-    def archive_command(self, name: str) -> list[str]:
+    def archive_command(self, name: str, *, destination: Path | None = None) -> list[str]:
+        target_dir = destination or self.config.archive_dir
         queue_item = shlex.quote(str(self.config.queue_dir / name))
-        archive_dir = shlex.quote(str(self.config.archive_dir))
-        archive_item = shlex.quote(str(self.config.archive_dir / name))
+        archive_dir = shlex.quote(str(target_dir))
+        archive_item = shlex.quote(str(target_dir / name))
         # Idempotentně: když soubor ve frontě není (přesunutý předchozím
         # během), nic se neděje a návratový kód zůstává nulový.
         script = (
@@ -128,13 +133,26 @@ class SshRemoteQueue(RemoteQueue):
         return sorted(item for item in destination.iterdir() if item.is_file())
 
     def archive(self, name: str) -> bool:
-        result = self._run(
-            self.archive_command(name),
-            timeout=self.config.connect_timeout_s + 30,
-        )
+        return self._move(name, self.config.archive_dir)
+
+    def reject(self, name: str) -> bool:
+        return self._move(name, self.config.rejected_dir)
+
+    def _move(self, name: str, destination: Path) -> bool:
+        try:
+            result = self._run(
+                self.archive_command(name, destination=destination),
+                timeout=self.config.connect_timeout_s + 30,
+            )
+        except RemoteUnavailable as exc:
+            log.warning("nepodařilo se přesunout %s na Pi: %s", name, exc)
+            return False
         if result.returncode != 0:
             log.warning(
-                "nepodařilo se archivovat %s na Pi: %s", name, result.stderr.strip()
+                "nepodařilo se přesunout %s do %s: %s",
+                name,
+                destination,
+                result.stderr.strip(),
             )
             return False
         return True
@@ -159,11 +177,17 @@ class LocalRemoteQueue(RemoteQueue):
         return sorted(item for item in destination.iterdir() if item.is_file())
 
     def archive(self, name: str) -> bool:
+        return self._move(name, self.config.archive_dir)
+
+    def reject(self, name: str) -> bool:
+        return self._move(name, self.config.rejected_dir)
+
+    def _move(self, name: str, destination: Path) -> bool:
         source = self.config.queue_dir / name
-        self.config.archive_dir.mkdir(parents=True, exist_ok=True)
+        destination.mkdir(parents=True, exist_ok=True)
         if not source.exists():
             return True
-        shutil.move(str(source), str(self.config.archive_dir / name))
+        shutil.move(str(source), str(destination / name))
         return True
 
 

@@ -51,13 +51,41 @@ worker:
   ffprobe_path: ffprobe
   rsync_path: rsync
   ssh_path: ssh
-# --- fáze 2 a 3 (zatím se nečte) ---------------------------------------
-#
-#   transcribe:
-#     model: large-v3
-#     language: cs
-#     vad: true
-#     initial_prompt_terms: [Obsidian, Tailscale, Syncthing]
+
+  transcribe:
+    # false = poznámka vznikne s placeholderem místo přepisu.
+    # Hodí se na ověření transportu bez čekání na model.
+    enabled: true
+
+    model: large-v3
+    device: auto # auto | cuda | cpu
+    compute_type: auto # na 6GB kartě dává smysl float16
+
+    # Explicitně, nikdy autodetekce — ta u krátkých nahrávek přepne na slovenštinu.
+    language: cs
+    beam_size: 5
+
+    # Bez VAD model v tichých pasážích halucinuje opakující se nesmysly.
+    # Nahrávka, ve které VAD nenajde řeč, jde do archive/rejected/.
+    vad: true
+    vad_threshold: 0.5
+    vad_min_silence_ms: 500
+
+    # Zabraňuje zacyklení na jedné frázi.
+    condition_on_previous_text: false
+
+    # Slovníček jmen a termínů, které model bez nápovědy komolí.
+    initial_prompt_terms:
+      - Obsidian
+      - Tailscale
+      - Syncthing
+      - faster-whisper
+    # Celou nápovědu jde napsat i ručně; přebije seznam výše.
+    # initial_prompt: "Poznámky k vývoji. Obsidian, Tailscale, Syncthing."
+
+    # Kam stahovat váhy modelu (výchozí je ~/.cache/huggingface).
+    # download_root: ~/.cache/voicenotes-models
+# --- fáze 3 (zatím se nečte) -------------------------------------------
 #
 #   structure:
 #     backend: ollama            # ollama | anthropic

@@ -23,8 +23,23 @@ from ..config import ConfigError, WorkerConfig, load_worker_config
 from ..ids import TS_FORMAT, parse_id, sha256_file, slugify
 from .audio import probe_duration_s
 from .ledger import Ledger
-from .notes import STATUS_NEEDS_REVIEW, NoteData, render_note
+from .notes import (
+    STATUS_INBOX,
+    STATUS_NEEDS_REVIEW,
+    STATUS_REJECTED,
+    NoteData,
+    render_note,
+    title_from_transcript,
+)
 from .remote import RemoteQueue, RemoteUnavailable, build_remote
+from .transcribe import (
+    NoSpeechFound,
+    Transcriber,
+    TranscriberUnavailable,
+    TranscriptionFailed,
+    Transcript,
+    build_transcriber,
+)
 from .vault import VaultWriteError, ensure_vault, write_note
 
 log = logging.getLogger("voicenotes.worker")
@@ -32,9 +47,16 @@ log = logging.getLogger("voicenotes.worker")
 #: Nad tímhle rozdílem mezi názvem a mtime už jde nejspíš o špatnou časovou zónu.
 CLOCK_SKEW_TOLERANCE_S = 5 * 60
 
+PLACEHOLDER_TITLE = "Nezpracovaná nahrávka {hash}"
+
 PLACEHOLDER_SUMMARY = (
-    "Přepis zatím není zapnutý (fáze 1 – transport). "
+    "Přepis je vypnutý (`worker.transcribe.enabled: false`). "
     "Audio je uložené na serveru, cesta je ve frontmatteru."
+)
+
+FAILED_SUMMARY = (
+    "Přepis selhal, audio ale zůstalo na serveru — cesta je ve frontmatteru "
+    "a přepis jde spustit znovu ručně."
 )
 
 
@@ -43,12 +65,14 @@ class RunStats:
     fetched: int = 0
     created: int = 0
     skipped: int = 0
+    rejected: int = 0
     failed: int = 0
 
     def as_line(self) -> str:
         return (
             f"staženo={self.fetched} poznámek={self.created} "
-            f"přeskočeno={self.skipped} chyb={self.failed}"
+            f"přeskočeno={self.skipped} bez řeči={self.rejected} "
+            f"chyb={self.failed}"
         )
 
 
@@ -102,19 +126,40 @@ def build_note(
     audio_path: Path,
     digest_prefix: str,
     created: datetime,
+    transcript: Transcript | None,
+    error: str | None = None,
 ) -> NoteData:
-    """Fáze 1: poznámka s placeholderem.
+    """Poznámka z toho, co o nahrávce víme.
 
-    Fáze 2 sem doplní přepis, fáze 3 titulek, shrnutí, tagy a úkoly.
+    Fáze 3 sem doplní shrnutí, tagy a úkoly; titulek pak přijde od modelu
+    místo z prvních slov přepisu.
     """
-    return NoteData(
-        title=f"Nezpracovaná nahrávka {digest_prefix}",
+    note = NoteData(
+        title=PLACEHOLDER_TITLE.format(hash=digest_prefix),
         created=created,
         audio=f"{config.remote.display}:{config.remote.archive_dir / audio_path.name}",
         status=STATUS_NEEDS_REVIEW,
         duration_s=probe_duration_s(audio_path, ffprobe_path=config.ffprobe_path),
-        summary=PLACEHOLDER_SUMMARY,
     )
+
+    if error is not None:
+        # Přepis selhal: poznámka přesto vznikne, chyba je v těle.
+        note.title = f"Nepřepsaná nahrávka {digest_prefix}"
+        note.summary = FAILED_SUMMARY
+        note.error = error
+        return note
+
+    if transcript is None:
+        # Přepis je vypnutý (fáze 1 – ověření transportu).
+        note.summary = PLACEHOLDER_SUMMARY
+        return note
+
+    note.title = title_from_transcript(transcript.text)
+    note.status = STATUS_INBOX
+    note.transcript = transcript.text
+    note.transcript_model = transcript.model
+    note.duration_s = transcript.duration_s or note.duration_s
+    return note
 
 
 def process_one(
@@ -125,6 +170,7 @@ def process_one(
     audio_path: Path,
     tzinfo: timezone | ZoneInfo,
     stats: RunStats,
+    transcriber: Transcriber | None,
 ) -> None:
     name = audio_path.name
     parsed = parse_id(name)
@@ -152,8 +198,41 @@ def process_one(
 
     created = stamp.replace(tzinfo=tzinfo)
     warn_on_clock_skew(audio_path, created)
+
+    transcript: Transcript | None = None
+    error: str | None = None
+    if transcriber is not None:
+        try:
+            transcript = transcriber.transcribe(audio_path)
+            log.info(
+                "%s přepsáno (%d s, %d segmentů)",
+                name,
+                transcript.duration_s or 0,
+                transcript.segments,
+            )
+        except NoSpeechFound as exc:
+            # Falešné spuštění v kapse. Poznámka nevzniká, audio se schová
+            # do rejected/ — ať se dá zpětně ověřit, že tam opravdu nic nebylo.
+            log.info("%s: %s → archive/rejected/", name, exc)
+            ledger.record(
+                identifier, note=None, status=STATUS_REJECTED, when=datetime.now(tzinfo)
+            )
+            processed.add(identifier)
+            remote.reject(name)
+            audio_path.unlink(missing_ok=True)
+            stats.rejected += 1
+            return
+        except TranscriptionFailed as exc:
+            log.error("přepis %s selhal: %s", name, exc)
+            error = str(exc)
+
     note = build_note(
-        config, audio_path=audio_path, digest_prefix=digest_prefix, created=created
+        config,
+        audio_path=audio_path,
+        digest_prefix=digest_prefix,
+        created=created,
+        transcript=transcript,
+        error=error,
     )
     stem = f"{stamp.strftime(TS_FORMAT)}-{slugify(note.title)}"
 
@@ -174,13 +253,23 @@ def process_one(
     remote.archive(name)
     audio_path.unlink(missing_ok=True)
     stats.created += 1
+    if error is not None:
+        stats.failed += 1
 
 
-def run(config: WorkerConfig, *, remote: RemoteQueue | None = None) -> RunStats:
+def run(
+    config: WorkerConfig,
+    *,
+    remote: RemoteQueue | None = None,
+    transcriber: Transcriber | None = None,
+) -> RunStats:
     stats = RunStats()
     remote = remote or build_remote(
         config.remote, ssh_path=config.ssh_path, rsync_path=config.rsync_path
     )
+    if transcriber is None and config.transcribe.enabled:
+        # Model se načte až u první nahrávky; prázdná fronta na něj nesáhne.
+        transcriber = build_transcriber(config.transcribe)
 
     config.work_dir.mkdir(parents=True, exist_ok=True)
     lock = acquire_lock(config.lock_path)
@@ -211,7 +300,20 @@ def run(config: WorkerConfig, *, remote: RemoteQueue | None = None) -> RunStats:
         tzinfo = resolve_timezone(config.timezone)
         for audio_path in files:
             try:
-                process_one(config, remote, ledger, processed, audio_path, tzinfo, stats)
+                process_one(
+                    config,
+                    remote,
+                    ledger,
+                    processed,
+                    audio_path,
+                    tzinfo,
+                    stats,
+                    transcriber,
+                )
+            except TranscriberUnavailable:
+                # Systémová chyba: potkala by každou nahrávku. Radši zastavit
+                # a nechat frontu být, než vysypat do vaultu samé chyby.
+                raise
             except Exception:  # noqa: BLE001 - jedna vadná nahrávka nesmí zastavit frontu
                 log.exception("nezachycená chyba u %s", audio_path.name)
                 stats.failed += 1
@@ -219,6 +321,9 @@ def run(config: WorkerConfig, *, remote: RemoteQueue | None = None) -> RunStats:
         log.info("hotovo: %s", stats.as_line())
         return stats
     finally:
+        # Fáze 3 si tady vyzvedne volnou VRAM pro strukturovací model.
+        if transcriber is not None:
+            transcriber.unload()
         fcntl.flock(lock, fcntl.LOCK_UN)
         lock.close()
 
@@ -244,6 +349,10 @@ def main(argv: list[str] | None = None) -> int:
         run(config)
     except VaultWriteError as exc:
         print(f"vault není použitelný: {exc}", file=sys.stderr)
+        return 1
+    except TranscriberUnavailable as exc:
+        # Fronta zůstala nedotčená, další běh to zkusí znovu.
+        print(f"přepis není k dispozici: {exc}", file=sys.stderr)
         return 1
     return 0
 

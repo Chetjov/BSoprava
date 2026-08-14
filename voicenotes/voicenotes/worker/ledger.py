@@ -40,7 +40,10 @@ class Ledger:
                     found.add(identifier)
         return found
 
-    def record(self, identifier: str, *, note: str, status: str, when: datetime) -> None:
+    def record(
+        self, identifier: str, *, note: str | None, status: str, when: datetime
+    ) -> None:
+        """`note=None` u nahrávek, ke kterým poznámka schválně nevznikla."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         entry = {
             "id": identifier,

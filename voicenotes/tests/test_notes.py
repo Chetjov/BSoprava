@@ -8,7 +8,14 @@ import pytest
 import yaml
 
 from voicenotes.ids import ALLOWED_SUFFIXES, make_id, parse_id, safe_suffix, slugify
-from voicenotes.worker.notes import NoteData, dump_frontmatter, render_note, yaml_scalar
+from voicenotes.worker.notes import (
+    FALLBACK_TITLE,
+    NoteData,
+    dump_frontmatter,
+    render_note,
+    title_from_transcript,
+    yaml_scalar,
+)
 
 PRAGUE = timezone(timedelta(hours=2))
 
@@ -166,6 +173,39 @@ def test_slug_is_bounded_and_does_not_cut_mid_word():
 
     assert len(slug) <= 30
     assert not slug.endswith("-")
+
+
+@pytest.mark.parametrize(
+    ("transcript", "expected"),
+    [
+        # Titulek končí na hranici věty, ne uprostřed myšlenky.
+        (
+            "Přepracovat retry logiku v importu. Padá to na timeoutu.",
+            "Přepracovat retry logiku v importu",
+        ),
+        # Bez interpunkce se bere prvních pár slov.
+        (
+            "přepracovat retry logiku v importu, padá to na timeoutu",
+            "Přepracovat retry logiku v importu, padá to na",
+        ),
+        # Příliš krátká první věta sama o sobě titulek nedá.
+        ("Hele. Tohle je nápad na příště.", "Hele. Tohle je nápad na příště"),
+        ("Krátká myšlenka.", "Krátká myšlenka"),
+        ("...", FALLBACK_TITLE),
+        ("", FALLBACK_TITLE),
+        ("   ", FALLBACK_TITLE),
+    ],
+)
+def test_title_from_transcript(transcript, expected):
+    assert title_from_transcript(transcript) == expected
+
+
+def test_title_from_transcript_does_not_cut_mid_word():
+    title = title_from_transcript("nej" + "dlouhe " * 20)
+
+    assert len(title) <= 70
+    assert not title.endswith("-")
+    assert title.split()[-1] in {"dlouhe", "nejdlouhe"}
 
 
 def test_id_roundtrip():

@@ -12,8 +12,8 @@ dependencies = ["pyyaml>=6.0"]
 [project.optional-dependencies]
 # Na Pi stačí tohle.
 gateway = ["fastapi>=0.110", "uvicorn>=0.27", "python-multipart>=0.0.9"]
-# Na notebooku; faster-whisper přibude ve fázi 2.
-worker = []
+# Na notebooku. CUDA runtime se instaluje mimo pip, viz README.
+worker = ["faster-whisper>=1.0"]
 dev = ["pytest>=8.0", "httpx>=0.27", "fastapi>=0.110", "python-multipart>=0.0.9"]
 
 [project.scripts]

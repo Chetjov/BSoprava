@@ -11,6 +11,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from voicenotes.config import load_gateway_config, load_worker_config  # noqa: E402
+from voicenotes.worker.transcribe import Transcriber, Transcript  # noqa: E402
 
 TOKEN = "test-token-123"
 #: Malý limit, ať se velké soubory netestují velkými soubory.
@@ -73,6 +74,8 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Env:
             "timezone": "Europe/Prague",
             # ffprobe v CI není; ať se netestuje na jeho přítomnosti.
             "ffprobe_path": "ffprobe-neexistuje",
+            # Testy transportu běží bez modelu; fáze 2 si přepisovač podstrčí.
+            "transcribe": {"enabled": False},
         },
     }
     config_path = tmp_path / "config.yaml"
@@ -101,6 +104,45 @@ def audio_bytes(seed: bytes = b"nahravka", size: int = 2048) -> bytes:
         out.extend(block)
         block = hashlib.sha256(block).digest()
     return bytes(out[:size])
+
+
+class FakeTranscriber(Transcriber):
+    """Přepisovač bez modelu — vrátí, co mu test nastaví.
+
+    `per_file` mapuje název souboru na text nebo na výjimku, kterou má
+    přepis vyhodit.
+    """
+
+    def __init__(
+        self,
+        default: str | Exception = "Přepracovat retry logiku v importu.",
+        per_file: dict[str, str | Exception] | None = None,
+        *,
+        model: str = "large-v3",
+        duration_s: int | None = 47,
+    ) -> None:
+        self.default = default
+        self.per_file = per_file or {}
+        self.model = model
+        self.duration_s = duration_s
+        self.calls: list[str] = []
+        self.unloaded = 0
+
+    def transcribe(self, path: Path) -> Transcript:
+        self.calls.append(path.name)
+        outcome = self.per_file.get(path.name, self.default)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return Transcript(
+            text=outcome,
+            model=self.model,
+            language="cs",
+            duration_s=self.duration_s,
+            segments=outcome.count(".") or 1,
+        )
+
+    def unload(self) -> None:
+        self.unloaded += 1
 
 
 def upload(client, data: bytes, *, token: str = TOKEN, filename: str = "rec.m4a"):

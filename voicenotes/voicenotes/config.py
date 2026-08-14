@@ -117,6 +117,10 @@ class RemoteConfig:
         return self.root / "archive"
 
     @property
+    def rejected_dir(self) -> Path:
+        return self.archive_dir / "rejected"
+
+    @property
     def target(self) -> str:
         """Cíl pro ssh/rsync, tj. ``user@host`` nebo jen ``host``."""
         return f"{self.user}@{self.host}" if self.user else self.host
@@ -173,10 +177,64 @@ class VaultConfig:
 
 
 @dataclass(frozen=True)
+class TranscribeConfig:
+    """Fáze 2 — přepis. Výchozí hodnoty jsou laděné na češtinu z kapsy."""
+
+    enabled: bool = True
+    model: str = "large-v3"
+    device: str = "auto"
+    compute_type: str = "auto"
+    #: Explicitně, nikdy autodetekce — ta u krátkých nahrávek přepne na slovenštinu.
+    language: str = "cs"
+    beam_size: int = 5
+    vad: bool = True
+    vad_threshold: float = 0.5
+    vad_min_silence_ms: int = 500
+    #: Vypnuté kvůli smyčkám, ve kterých se model zacyklí na jedné frázi.
+    condition_on_previous_text: bool = False
+    initial_prompt_terms: tuple[str, ...] = ()
+    initial_prompt_override: str | None = None
+    download_root: Path | None = None
+
+    def build_initial_prompt(self) -> str | None:
+        """Slovníček jmen a termínů, které model bez nápovědy komolí."""
+        if self.initial_prompt_override:
+            return self.initial_prompt_override
+        if not self.initial_prompt_terms:
+            return None
+        return ", ".join(self.initial_prompt_terms) + "."
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> TranscribeConfig:
+        terms = data.get("initial_prompt_terms") or []
+        if not isinstance(terms, list):
+            raise ConfigError("config: worker.transcribe.initial_prompt_terms musí být seznam")
+        download_root = data.get("download_root")
+        return cls(
+            enabled=bool(data.get("enabled", True)),
+            model=str(data.get("model", "large-v3")),
+            device=str(data.get("device", "auto")),
+            compute_type=str(data.get("compute_type", "auto")),
+            language=str(data.get("language", "cs")),
+            beam_size=int(data.get("beam_size", 5)),
+            vad=bool(data.get("vad", True)),
+            vad_threshold=float(data.get("vad_threshold", 0.5)),
+            vad_min_silence_ms=int(data.get("vad_min_silence_ms", 500)),
+            condition_on_previous_text=bool(data.get("condition_on_previous_text", False)),
+            initial_prompt_terms=tuple(str(term) for term in terms),
+            initial_prompt_override=(
+                str(data["initial_prompt"]) if data.get("initial_prompt") else None
+            ),
+            download_root=_expand(download_root) if download_root else None,
+        )
+
+
+@dataclass(frozen=True)
 class WorkerConfig:
     remote: RemoteConfig
     vault: VaultConfig
     work_dir: Path
+    transcribe: TranscribeConfig = field(default_factory=TranscribeConfig)
     timezone: str = "Europe/Prague"
     ffprobe_path: str = "ffprobe"
     rsync_path: str = "rsync"
@@ -206,6 +264,7 @@ class WorkerConfig:
             remote=RemoteConfig.from_dict(_section(data, "remote")),
             vault=VaultConfig.from_dict(_section(data, "vault")),
             work_dir=_expand(_require(data, "work_dir", "worker")),
+            transcribe=TranscribeConfig.from_dict(data.get("transcribe") or {}),
             timezone=str(data.get("timezone", "Europe/Prague")),
             ffprobe_path=str(data.get("ffprobe_path", "ffprobe")),
             rsync_path=str(data.get("rsync_path", "rsync")),
