@@ -69,12 +69,30 @@ Spuštění:
 sudo cp systemd/voicenotes-gateway.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now voicenotes-gateway
-curl -s http://<pi-tailscale>:8080/health      # {"status":"ok","queued":0}
+curl -s http://127.0.0.1:8080/health           # {"status":"ok","queued":0}
 ```
 
-Endpoint poslouchá na tailscale rozhraní, ne na `0.0.0.0`. S `host: tailscale`
-si adresu zjistí sám přes `tailscale ip -4`; poslech na všech rozhraních jde
-zapnout jen ručně přes `allow_public_bind: true`.
+Endpoint nikdy neposlouchá na `0.0.0.0` — to jde zapnout jen ručně přes
+`allow_public_bind: true`.
+
+### HTTPS
+
+Zkratka na telefonu posílá na `https://<pi-tailscale>/ingest`. TLS řeší
+Tailscale, gateway zůstává obyčejné HTTP na loopbacku:
+
+```bash
+# jednou v adminu tailnetu: DNS → HTTPS Certificates → Enable
+sudo tailscale serve --bg 8080
+sudo tailscale serve status
+curl -s https://<pi>.<tailnet>.ts.net/health
+```
+
+S `tailscale serve` nech v configu `host: 127.0.0.1` — ven se gateway dostane
+jen přes tailnet a certifikát obhospodařuje Tailscale.
+
+Bez `serve` (přímo HTTP na tailscale rozhraní) nastav `host: tailscale`,
+adresu si gateway zjistí přes `tailscale ip -4`, a v URL zkratky zůstane
+`http://<pi-tailscale>:8080/ingest`.
 
 ## Instalace — notebook (worker)
 
@@ -124,14 +142,20 @@ ladění nechat být:
 
 - **`language: cs` explicitně.** Autodetekce u krátkých nahrávek přepne na
   slovenštinu.
-- **VAD zapnutý.** Bez něj model v tichých pasážích halucinuje opakující se
-  nesmysly, což je u nahrávek z venku běžné. Nahrávka, ve které VAD nenajde
-  řeč (spuštění v kapse), jde do `archive/rejected/` a poznámka nevzniká.
+- **VAD zapnutý.** Nahrávky vznikají venku, za chůze, s pauzami na přemýšlení
+  a s větrem. V tichých pasážích model halucinuje opakující se nesmysly a nacpe
+  je do přepisu — tohle není optimalizace, bez toho pipeline nefunguje.
+  Nahrávka, ve které VAD nenajde řeč (spuštění v kapse), jde do
+  `archive/rejected/` a poznámka nevzniká.
 - **`condition_on_previous_text: false`.** Brání zacyklení na jedné frázi.
 
 `initial_prompt_terms` je slovníček jmen a termínů, které model bez nápovědy
 komolí. Skládá se z něj jedna věta, kterou dostane model na vstupu; celou
 nápovědu jde přepsat ručně přes `initial_prompt`.
+
+Ve frontmatteru jsou dvě délky: `duration_s` je celá nahrávka, `speech_s` je
+řeč po ořezu VAD. Velký rozdíl mezi nimi znamená, že se nahrává hodně ticha,
+a stojí za to se podívat proč.
 
 Model se načítá až u první nahrávky — prázdná fronta na disk nesáhne — a po
 skončení běhu se uvolní z paměti. Na 6 GB VRAM se whisper a strukturovací
@@ -159,7 +183,7 @@ Audio ve vaultu není a nebude; ve frontmatteru je jen cesta na Pi.
 | Situace | Chování |
 |---|---|
 | Špatný token | 401, do fronty se nic nezapíše |
-| Soubor nad limit | 413, v `.tmp/` nezůstane půlka souboru |
+| Soubor nad limit | 413 + záznam v žurnálu, v `.tmp/` nezůstane půlka souboru |
 | Nahrávka odeslaná dvakrát | Stejný obsah = stejný název, druhý pokus přepíše ten samý soubor |
 | Nahrávka už zpracovaná | Gateway ji nevrátí do fronty, worker ji přeskočí podle evidence |
 | Pi nedostupné | Worker skončí tiše, zkusí to příští běh |
@@ -212,12 +236,15 @@ views:
     order: [file.name, created, duration_s, tags]
 ```
 
-## iOS Shortcut
+## Strana telefonu
 
-Shortcut si stavíš sám, gateway sedí na tento kontrakt:
+Zachycení a odeslání jsou dva oddělené kroky: nahrává se nativním Diktafonem
+z ovládacího prvku na zamykací obrazovce, odesílá samostatná zkratka spouštěná
+automatizací při připojení k domácí WiFi. Gateway na tom nezávisí — drží jen
+tenhle kontrakt:
 
 ```
-POST http://<pi-tailscale>:8080/ingest
+POST https://<pi-tailscale>/ingest
 Header: X-Auth-Token: <token z /etc/voicenotes/gateway.env>
 Body:   multipart/form-data, pole "audio" = .m4a
 → 200 {"status": "queued", "id": "2026-08-14T143211-a3f9c1.m4a"}
@@ -229,10 +256,28 @@ Body:   multipart/form-data, pole "audio" = .m4a
 Ověření z terminálu:
 
 ```bash
-curl -X POST http://<pi-tailscale>:8080/ingest \
+curl -X POST https://<pi>.<tailnet>.ts.net/ingest \
   -H "X-Auth-Token: $VOICENOTES_TOKEN" \
   -F 'audio=@nahravka.m4a;type=audio/m4a'
 ```
+
+**Opakované odeslání nevadí.** Když zkratka selže, nahrávka zůstává v Diktafonu
+a příště se pošle znovu; gateway pozná stejný obsah podle hashe a vrátí původní
+`id` místo aby vznikl duplikát. Platí to i pro nahrávku, kterou už worker
+zpracoval — do fronty se nevrátí.
+
+**Zkontroluj kvalitu záznamu v Diktafonu** (Nastavení → Diktafon → Kvalita
+zvuku). Délka nahrávky je proměnná, takže rozhoduje datový tok:
+
+| Nastavení | Přibližně | 25 MB vystačí na |
+|---|---|---|
+| Komprimovaný | ~0,25 MB/min | ~100 minut |
+| Bezeztrátový | ~5,5 MB/min | ~4,5 minuty |
+
+Na bezeztrátovém záznamu delší poznámka narazí na limit — buď přepni na
+komprimovaný, nebo zvedni `gateway.max_upload_mb`. Odmítnutá nahrávka se
+zaloguje do žurnálu gateway; bez toho by ji telefon zkoušel poslat při každém
+připojení k WiFi a nikdy by se neobjevila ve vaultu.
 
 ## Vývoj
 

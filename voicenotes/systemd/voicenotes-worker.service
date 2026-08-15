@@ -10,4 +10,6 @@ Type=oneshot
 Environment=VOICENOTES_CONFIG=%h/.config/voicenotes/config.yaml
 ExecStart=%h/.local/share/voicenotes/venv/bin/voicenotes-worker
 # Prázdná fronta i vypnuté Pi končí nulou — v žurnálu nic nesvítí.
-TimeoutStartSec=30min
+# Délka nahrávek je proměnná a po víkendu může fronta obsahovat desítky minut
+# zvuku; useknout worker uprostřed je horší než ho nechat doběhnout.
+TimeoutStartSec=2h

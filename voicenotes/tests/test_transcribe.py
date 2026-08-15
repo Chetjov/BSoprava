@@ -29,7 +29,13 @@ def queue_recording(env, data: bytes, *, when: str = "2026-08-14T143211") -> str
     return name
 
 
-def fake_model(segments: list[str], *, duration: float = 47.3, raises=None):
+def fake_model(
+    segments: list[str],
+    *,
+    duration: float = 52.4,
+    duration_after_vad: float = 47.3,
+    raises=None,
+):
     """Napodobenina `WhisperModel` — zapamatuje si, s čím ji zavolali."""
 
     class Model:
@@ -42,7 +48,9 @@ def fake_model(segments: list[str], *, duration: float = 47.3, raises=None):
             self.kwargs = kwargs
             if raises is not None:
                 raise raises
-            info = SimpleNamespace(duration=duration, language="cs")
+            info = SimpleNamespace(
+                duration=duration, duration_after_vad=duration_after_vad, language="cs"
+            )
             return (SimpleNamespace(text=text) for text in segments), info
 
     return Model()
@@ -63,7 +71,8 @@ def test_transcript_becomes_a_note(env):
 
     assert "status: inbox" in text
     assert "transcript_model: large-v3" in text
-    assert "duration_s: 47" in text
+    assert "duration_s: 52" in text
+    assert "speech_s: 47" in text
     assert "## Přepis" in text
     # Surový přepis je jediná pravda — musí být v poznámce doslova.
     assert "Přepracovat retry logiku v importu. Padá to na timeoutu." in text
@@ -355,10 +364,36 @@ def test_segments_are_joined_into_one_transcript(tmp_path):
     result = transcriber.transcribe(audio)
 
     assert result.text == "Ahoj, tady je myšlenka."
-    assert result.duration_s == 47
+    assert result.duration_s == 52
+    assert result.speech_s == 47
     assert result.language == "cs"
     assert result.segments == 3
     assert model.kwargs["language"] == "cs"
+
+
+def test_speech_length_is_omitted_without_vad(tmp_path):
+    """Bez VAD se nic neořezává, takže `speech_s` nemá co říct."""
+    transcriber = FasterWhisperTranscriber(
+        TranscribeConfig(vad=False), model_factory=lambda c: fake_model(["ahoj"])
+    )
+    audio = tmp_path / "a.m4a"
+    audio.write_bytes(b"x")
+
+    result = transcriber.transcribe(audio)
+
+    assert result.duration_s == 52
+    assert result.speech_s is None
+
+
+def test_note_shows_speech_next_to_total_length(env):
+    """Velký rozdíl mezi délkami znamená hodně ticha v nahrávce."""
+    queue_recording(env, audio_bytes())
+
+    run(env.worker, transcriber=FakeTranscriber(duration_s=305, speech_s=42))
+
+    text = env.notes()[0].read_text(encoding="utf-8")
+    assert "duration_s: 305" in text
+    assert "speech_s: 42" in text
 
 
 def test_model_is_loaded_once_for_the_whole_queue(tmp_path):

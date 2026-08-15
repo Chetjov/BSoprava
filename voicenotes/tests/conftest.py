@@ -119,12 +119,14 @@ class FakeTranscriber(Transcriber):
         per_file: dict[str, str | Exception] | None = None,
         *,
         model: str = "large-v3",
-        duration_s: int | None = 47,
+        duration_s: int | None = 52,
+        speech_s: int | None = 47,
     ) -> None:
         self.default = default
         self.per_file = per_file or {}
         self.model = model
         self.duration_s = duration_s
+        self.speech_s = speech_s
         self.calls: list[str] = []
         self.unloaded = 0
 
@@ -138,6 +140,7 @@ class FakeTranscriber(Transcriber):
             model=self.model,
             language="cs",
             duration_s=self.duration_s,
+            speech_s=self.speech_s,
             segments=outcome.count(".") or 1,
         )
 

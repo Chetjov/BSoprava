@@ -26,7 +26,8 @@ def test_render_matches_the_agreed_shape():
         created=datetime(2026, 8, 14, 14, 32, 11, tzinfo=PRAGUE),
         audio="pi:/srv/voicenotes/archive/2026-08-14T143211-a3f9c1.m4a",
         status="inbox",
-        duration_s=47,
+        duration_s=52,
+        speech_s=47,
         transcript_model="large-v3",
         structure_model="qwen3:8b",
         tags=["napad"],
@@ -39,7 +40,8 @@ def test_render_matches_the_agreed_shape():
         "---\n"
         "created: 2026-08-14T14:32:11+02:00\n"
         "source: voice\n"
-        "duration_s: 47\n"
+        "duration_s: 52\n"
+        "speech_s: 47\n"
         "audio: pi:/srv/voicenotes/archive/2026-08-14T143211-a3f9c1.m4a\n"
         "transcript_model: large-v3\n"
         "structure_model: qwen3:8b\n"
