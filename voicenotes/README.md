@@ -9,7 +9,7 @@ iPhone (Shortcut)
    ▼
 Pi 4 — GATEWAY          uloží .m4a do fronty, vrátí 200, nic víc
    ▼
-Notebook — WORKER       rsync fronty → (přepis) → zápis .md
+Notebook — WORKER       rsync fronty → přepis → strukturování → zápis .md
    ▼
 Obsidian vault → Syncthing → iPhone
 ```
@@ -23,14 +23,13 @@ zapnutý. Když je vypnutý, fronta na Pi se plní a worker to dožene.
 |---|---|---|
 | 1 | Transport: gateway, worker, poznámka s placeholderem | **hotovo** |
 | 2 | Přepis (faster-whisper, VAD, chybové stavy) | **hotovo** |
-| 3 | Strukturování (ollama / anthropic, uzavřené tagy) | čeká |
-| 4 | Benchmark modelů + týdenní review skript | čeká |
+| 3 | Strukturování (ollama / anthropic, uzavřené tagy) | **hotovo** |
+| 4 | Benchmark modelů + týdenní review skript | **hotovo** |
 
-Poznámka teď obsahuje surový přepis a titulek z prvních slov. Shrnutí, tagy
-a úkoly přijdou ve fázi 3; do té doby zůstává `tags: []`.
-
-Přepis jde vypnout (`worker.transcribe.enabled: false`) — worker pak vyrobí
-poznámku s placeholderem. Hodí se na ověření transportu bez čekání na model.
+Každou fázi jde vypnout jedním klíčem a vrátit se o krok zpět:
+`worker.structure.enabled: false` dá poznámku se samotným přepisem,
+`worker.transcribe.enabled: false` jen placeholder. Hodí se na ověření
+transportu bez čekání na modely.
 
 ## Instalace — Pi 4 (gateway)
 
@@ -159,10 +158,41 @@ a stojí za to se podívat proč.
 
 Model se načítá až u první nahrávky — prázdná fronta na disk nesáhne — a po
 skončení běhu se uvolní z paměti. Na 6 GB VRAM se whisper a strukturovací
-model nevejdou zároveň, což bude podstatné ve fázi 3.
+model nevejdou zároveň — proto worker jede na dva průchody, viz níž.
 
 Ruční přepis jedné nahrávky (třeba po `needs-review`) zatím není zabalený do
 příkazu; audio zůstává v `archive/` na Pi, takže jde pustit whisper napřímo.
+
+## Strukturování
+
+Z přepisu vzniká titulek, shrnutí, tagy a úkoly. Backend se přepíná **jedním
+klíčem** (`worker.structure.backend`) mezi lokálním modelem a Claude API:
+
+```bash
+# lokálně — bez dalších závislostí, mluví se přes HTTP
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull qwen3:8b
+
+# nebo přes Claude API
+pip install 'voicenotes[anthropic]'
+export ANTHROPIC_API_KEY=sk-ant-...   # do prostředí služby, ne do configu
+```
+
+**Oba backendy dostávají stejný prompt i stejné JSON schéma**, takže se dají
+porovnat na stejných datech — liší se jen model. Ve frontmatteru je pak
+`structure_model`, podle kterého jde poznámky zpětně rozdělit.
+
+Tři věci si pipeline hlídá sama, ne promptem:
+
+- **Tagy jen z uzavřeného seznamu v configu.** Co model vrátí mimo něj, se
+  zahodí — bez toho je za dva měsíce ve vaultu dvě stě unikátních tagů.
+  `nápad` i `#Napad` se uznají jako `napad`, `brainstorming` vypadne.
+- **Žádné wikilinks.** Model neví, jaké poznámky ve vaultu existují; `[[Import]]`
+  se z titulku, shrnutí i úkolů odstraní (`[[cíl|popis]]` zůstane jako `popis`).
+- **Titulek na jeden řádek a rozumnou délku** — dělá se z něj název souboru.
+
+Worker jede na dva průchody: nejdřív přepíše celou frontu, pak **uvolní whisper
+z paměti** a teprve potom sáhne na LLM. Na 6 GB VRAM se oba nevejdou zároveň.
 
 ## Syncthing
 
@@ -191,6 +221,9 @@ Audio ve vaultu není a nebude; ve frontmatteru je jen cesta na Pi.
 | VAD nenajde řeč | Do `archive/rejected/`, poznámka nevzniká, log |
 | Přepis selže | Poznámka **vznikne** se `status: needs-review` a chybou v těle |
 | Model se nenačte | Běh se zastaví nenulovým kódem, fronta zůstane nedotčená |
+| Strukturování selže | Poznámka vznikne s titulkem z prvních slov přepisu, `status: needs-review` |
+| LLM backend nedostupný | Ohlásí se jednou za běh, poznámky vzniknou bez strukturování |
+| Model vrátí tag mimo seznam | Tag se zahodí, poznámka vznikne |
 | Cílová poznámka existuje | Přidá se suffix `-2`, existující soubor se nikdy nepřepíše |
 | Zápis poznámky selže | Nahrávka zůstává ve frontě, další běh to zkusí znovu |
 | Dva běhy najednou | Druhý zjistí zámek a skončí |
@@ -215,7 +248,22 @@ Pi" jen složka na disku a rsync ani ssh se nepoužijí.
 
 ## Review poznámek
 
-Týdenní review skript přijde ve fázi 4. Do té doby dotaz nad inboxem:
+Bez téhle smyčky se z vaultu stane hřbitov. Skript spočítá poznámky se
+`status: inbox` starší než týden a vyrobí `Inbox/_review-<datum>.md`
+se seznamem odkazů:
+
+```bash
+voicenotes-review --config ~/.config/voicenotes/config.yaml
+# 12 poznámek k projití → .../Inbox/_review-2026-08-15.md
+
+cp systemd/voicenotes-review.{service,timer} ~/.config/systemd/user/
+systemctl --user enable --now voicenotes-review.timer   # pondělí ráno
+```
+
+Přehled je nový soubor, existující poznámky se needitují. Wikilinks jsou tu
+naopak správně — míří na soubory, které opravdu existují.
+
+Totéž bez skriptu, dotazem nad inboxem:
 
 ```dataview
 TABLE created, duration_s, tags
@@ -288,13 +336,15 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev,gateway]'
 
 Testy jsou vážené na chybové stavy: atomický zápis, idempotence hashe, kolize
 názvů, špatný token, limit velikosti, nedostupné Pi, souběžné běhy, prázdná
-nahrávka, selhání přepisu, nenačtený model. Happy path je jeden, přes celou
-cestu od uploadu po soubor ve vaultu.
+nahrávka, selhání přepisu, nenačtený model, rozbitá odpověď LLM, tagy mimo
+seznam, nedostupný backend. Happy path je jeden, přes celou cestu od uploadu
+po soubor ve vaultu.
 
-Přepis se v testech nahrazuje falešným modelem, takže suita běží bez CUDA i bez
-stažených vah. Aby se překlep v parametru nedozvěděl až notebook, dva testy
-porovnávají použité parametry se skutečnými podpisy `faster_whisper`
-(přeskočí se, když knihovna není nainstalovaná).
+Modely se v testech nahrazují — whisper falešným přepisovačem, ollama falešným
+HTTP a Claude falešným klientem — takže suita běží bez CUDA, bez stažených vah
+i bez API klíče. Aby se překlep v parametru nedozvěděl až notebook, tři testy
+porovnávají použité parametry se skutečnými podpisy `faster_whisper` a
+`anthropic` (přeskočí se, když knihovna není nainstalovaná).
 
 ## Struktura
 
@@ -303,10 +353,13 @@ voicenotes/
 ├── config.py      načtení config.yaml, cesty, tajemství z prostředí
 ├── ids.py         název souboru = timestamp + hash obsahu (sdílí obě strany)
 ├── gateway.py     celý HTTP endpoint pro Pi
+├── bench.py       porovnání whisper modelů na vlastních nahrávkách
+├── review.py      týdenní přehled poznámek ležících v inboxu
 └── worker/
     ├── run.py        hlavní běh: stáhnout, přepsat, zapsat, uklidit
     ├── remote.py     fronta na Pi přes rsync/ssh (+ lokální varianta pro testy)
     ├── transcribe.py faster-whisper za rozhraním, které jde v testech nahradit
+    ├── structure.py  titulek/shrnutí/tagy/úkoly — ollama i Claude za jedním rozhraním
     ├── vault.py      zápis do vaultu — jen nové soubory, atomicky
     ├── notes.py      tvar markdown poznámky a frontmatteru
     ├── ledger.py     evidence zpracovaného (append-only JSONL, ne databáze)

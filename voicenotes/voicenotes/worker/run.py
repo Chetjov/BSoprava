@@ -32,6 +32,7 @@ from .notes import (
     title_from_transcript,
 )
 from .remote import RemoteQueue, RemoteUnavailable, build_remote
+from .structure import Structure, Structurer, StructuringFailed, build_structurer
 from .transcribe import (
     NoSpeechFound,
     Transcriber,
@@ -57,6 +58,11 @@ PLACEHOLDER_SUMMARY = (
 FAILED_SUMMARY = (
     "Přepis selhal, audio ale zůstalo na serveru — cesta je ve frontmatteru "
     "a přepis jde spustit znovu ručně."
+)
+
+UNSTRUCTURED_SUMMARY = (
+    "Strukturování selhalo, titulek je z prvních slov přepisu. "
+    "Surový přepis je celý níž."
 )
 
 
@@ -127,13 +133,10 @@ def build_note(
     digest_prefix: str,
     created: datetime,
     transcript: Transcript | None,
+    structure: Structure | None = None,
     error: str | None = None,
 ) -> NoteData:
-    """Poznámka z toho, co o nahrávce víme.
-
-    Fáze 3 sem doplní shrnutí, tagy a úkoly; titulek pak přijde od modelu
-    místo z prvních slov přepisu.
-    """
+    """Poznámka z toho, co o nahrávce víme."""
     note = NoteData(
         title=PLACEHOLDER_TITLE.format(hash=digest_prefix),
         created=created,
@@ -142,7 +145,7 @@ def build_note(
         duration_s=probe_duration_s(audio_path, ffprobe_path=config.ffprobe_path),
     )
 
-    if error is not None:
+    if error is not None and transcript is None:
         # Přepis selhal: poznámka přesto vznikne, chyba je v těle.
         note.title = f"Nepřepsaná nahrávka {digest_prefix}"
         note.summary = FAILED_SUMMARY
@@ -154,16 +157,45 @@ def build_note(
         note.summary = PLACEHOLDER_SUMMARY
         return note
 
-    note.title = title_from_transcript(transcript.text)
-    note.status = STATUS_INBOX
     note.transcript = transcript.text
     note.transcript_model = transcript.model
     note.duration_s = transcript.duration_s or note.duration_s
     note.speech_s = transcript.speech_s
+
+    if structure is not None:
+        note.title = structure.title
+        note.summary = structure.summary
+        note.tags = list(structure.tags)
+        note.tasks = list(structure.tasks)
+        note.structure_model = structure.model
+        note.status = STATUS_INBOX
+        return note
+
+    # Strukturování selhalo nebo je vypnuté: titulek z prvních slov přepisu.
+    note.title = title_from_transcript(transcript.text)
+    if error is None:
+        note.status = STATUS_INBOX
+    else:
+        note.status = STATUS_NEEDS_REVIEW
+        note.summary = UNSTRUCTURED_SUMMARY
+        note.error = error
     return note
 
 
-def process_one(
+@dataclass
+class Pending:
+    """Nahrávka, která má za sebou přepis a čeká na strukturování a zápis."""
+
+    audio_path: Path
+    identifier: str
+    digest_prefix: str
+    stamp: datetime
+    created: datetime
+    transcript: Transcript | None = None
+    error: str | None = None
+
+
+def transcribe_one(
     config: WorkerConfig,
     remote: RemoteQueue,
     ledger: Ledger,
@@ -172,13 +204,18 @@ def process_one(
     tzinfo: timezone | ZoneInfo,
     stats: RunStats,
     transcriber: Transcriber | None,
-) -> None:
+) -> Pending | None:
+    """První průchod: ověřit soubor a přepsat ho.
+
+    Vrací `None` u nahrávek, které dál nepokračují — už zpracované, poškozené
+    nebo zahozené VAD. Zbytek jde do druhého průchodu.
+    """
     name = audio_path.name
     parsed = parse_id(name)
     if parsed is None:
         log.warning("neznámý tvar názvu, nechávám na Pi: %s", name)
         stats.failed += 1
-        return
+        return None
 
     stamp, digest_prefix = parsed
     identifier = audio_path.stem
@@ -188,54 +225,104 @@ def process_one(
         remote.archive(name)
         audio_path.unlink(missing_ok=True)
         stats.skipped += 1
-        return
+        return None
 
     if not sha256_file(audio_path).startswith(digest_prefix):
         # Poškozený nebo useknutý přenos. Originál na Pi zůstává, příště znovu.
         log.warning("hash nesedí na %s, stahuji znovu příští běh", name)
         audio_path.unlink(missing_ok=True)
         stats.failed += 1
-        return
+        return None
 
     created = stamp.replace(tzinfo=tzinfo)
     warn_on_clock_skew(audio_path, created)
+    pending = Pending(
+        audio_path=audio_path,
+        identifier=identifier,
+        digest_prefix=digest_prefix,
+        stamp=stamp,
+        created=created,
+    )
 
-    transcript: Transcript | None = None
-    error: str | None = None
-    if transcriber is not None:
-        try:
-            transcript = transcriber.transcribe(audio_path)
-            log.info(
-                "%s přepsáno (%d s, %d segmentů)",
-                name,
-                transcript.duration_s or 0,
-                transcript.segments,
-            )
-        except NoSpeechFound as exc:
-            # Falešné spuštění v kapse. Poznámka nevzniká, audio se schová
-            # do rejected/ — ať se dá zpětně ověřit, že tam opravdu nic nebylo.
-            log.info("%s: %s → archive/rejected/", name, exc)
-            ledger.record(
-                identifier, note=None, status=STATUS_REJECTED, when=datetime.now(tzinfo)
-            )
-            processed.add(identifier)
-            remote.reject(name)
-            audio_path.unlink(missing_ok=True)
-            stats.rejected += 1
-            return
-        except TranscriptionFailed as exc:
-            log.error("přepis %s selhal: %s", name, exc)
-            error = str(exc)
+    if transcriber is None:
+        return pending
 
+    try:
+        pending.transcript = transcriber.transcribe(audio_path)
+        log.info(
+            "%s přepsáno (%d s, %d segmentů)",
+            name,
+            pending.transcript.duration_s or 0,
+            pending.transcript.segments,
+        )
+    except NoSpeechFound as exc:
+        # Falešné spuštění v kapse. Poznámka nevzniká, audio se schová
+        # do rejected/ — ať se dá zpětně ověřit, že tam opravdu nic nebylo.
+        log.info("%s: %s → archive/rejected/", name, exc)
+        ledger.record(
+            identifier, note=None, status=STATUS_REJECTED, when=datetime.now(tzinfo)
+        )
+        processed.add(identifier)
+        remote.reject(name)
+        audio_path.unlink(missing_ok=True)
+        stats.rejected += 1
+        return None
+    except TranscriptionFailed as exc:
+        log.error("přepis %s selhal: %s", name, exc)
+        pending.error = str(exc)
+    return pending
+
+
+def structure_one(
+    pending: Pending,
+    structurer: Structurer | None,
+    unavailable: str | None,
+) -> Structure | None:
+    """Druhý průchod: doplnit titulek, shrnutí, tagy a úkoly."""
+    if pending.transcript is None:
+        return None
+    if unavailable is not None:
+        pending.error = unavailable
+        return None
+    if structurer is None:
+        return None
+    try:
+        structure = structurer.structure(pending.transcript.text)
+    except StructuringFailed as exc:
+        log.error("strukturování %s selhalo: %s", pending.audio_path.name, exc)
+        pending.error = str(exc)
+        return None
+    log.info(
+        "%s strukturováno: %s (tagy: %s)",
+        pending.audio_path.name,
+        structure.title,
+        ", ".join(structure.tags) or "žádné",
+    )
+    return structure
+
+
+def finish_one(
+    config: WorkerConfig,
+    remote: RemoteQueue,
+    ledger: Ledger,
+    processed: set[str],
+    pending: Pending,
+    structure: Structure | None,
+    tzinfo: timezone | ZoneInfo,
+    stats: RunStats,
+) -> None:
+    """Zapsat poznámku, zaevidovat ji a uklidit audio."""
+    name = pending.audio_path.name
     note = build_note(
         config,
-        audio_path=audio_path,
-        digest_prefix=digest_prefix,
-        created=created,
-        transcript=transcript,
-        error=error,
+        audio_path=pending.audio_path,
+        digest_prefix=pending.digest_prefix,
+        created=pending.created,
+        transcript=pending.transcript,
+        structure=structure,
+        error=pending.error,
     )
-    stem = f"{stamp.strftime(TS_FORMAT)}-{slugify(note.title)}"
+    stem = f"{pending.stamp.strftime(TS_FORMAT)}-{slugify(note.title)}"
 
     try:
         written = write_note(config.vault, stem, render_note(note))
@@ -245,16 +332,16 @@ def process_one(
         return
 
     ledger.record(
-        identifier,
+        pending.identifier,
         note=str(written.relative_to(config.vault.root)),
         status=note.status,
         when=datetime.now(tzinfo),
     )
-    processed.add(identifier)
+    processed.add(pending.identifier)
     remote.archive(name)
-    audio_path.unlink(missing_ok=True)
+    pending.audio_path.unlink(missing_ok=True)
     stats.created += 1
-    if error is not None:
+    if pending.error is not None:
         stats.failed += 1
 
 
@@ -263,14 +350,18 @@ def run(
     *,
     remote: RemoteQueue | None = None,
     transcriber: Transcriber | None = None,
+    structurer: Structurer | None = None,
 ) -> RunStats:
     stats = RunStats()
+    transcriber_unloaded = False
     remote = remote or build_remote(
         config.remote, ssh_path=config.ssh_path, rsync_path=config.rsync_path
     )
     if transcriber is None and config.transcribe.enabled:
         # Model se načte až u první nahrávky; prázdná fronta na něj nesáhne.
         transcriber = build_transcriber(config.transcribe)
+    if structurer is None and config.structure.enabled:
+        structurer = build_structurer(config.structure)
 
     config.work_dir.mkdir(parents=True, exist_ok=True)
     lock = acquire_lock(config.lock_path)
@@ -299,17 +390,14 @@ def run(
         ledger = Ledger(config.ledger_path)
         processed = ledger.processed_ids()
         tzinfo = resolve_timezone(config.timezone)
+
+        # --- 1. průchod: přepis -------------------------------------------
+        pending: list[Pending] = []
+        transcriber_unloaded = False
         for audio_path in files:
             try:
-                process_one(
-                    config,
-                    remote,
-                    ledger,
-                    processed,
-                    audio_path,
-                    tzinfo,
-                    stats,
-                    transcriber,
+                item = transcribe_one(
+                    config, remote, ledger, processed, audio_path, tzinfo, stats, transcriber
                 )
             except TranscriberUnavailable:
                 # Systémová chyba: potkala by každou nahrávku. Radši zastavit
@@ -318,13 +406,41 @@ def run(
             except Exception:  # noqa: BLE001 - jedna vadná nahrávka nesmí zastavit frontu
                 log.exception("nezachycená chyba u %s", audio_path.name)
                 stats.failed += 1
+                continue
+            if item is not None:
+                pending.append(item)
+
+        # Whisper ven z paměti dřív, než se sáhne na LLM — na 6 GB VRAM se
+        # oba nevejdou zároveň.
+        if transcriber is not None:
+            transcriber.unload()
+            transcriber_unloaded = True
+
+        # --- 2. průchod: strukturování a zápis ----------------------------
+        unavailable: str | None = None
+        if structurer is not None and pending and not structurer.available():
+            unavailable = f"backend '{config.structure.backend}' není dostupný"
+            log.warning("%s, poznámky vzniknou bez strukturování", unavailable)
+
+        for item in pending:
+            try:
+                structure = structure_one(item, structurer, unavailable)
+                finish_one(
+                    config, remote, ledger, processed, item, structure, tzinfo, stats
+                )
+            except Exception:  # noqa: BLE001 - jedna poznámka nesmí zastavit zbytek
+                log.exception("nezachycená chyba u %s", item.audio_path.name)
+                stats.failed += 1
 
         log.info("hotovo: %s", stats.as_line())
         return stats
     finally:
-        # Fáze 3 si tady vyzvedne volnou VRAM pro strukturovací model.
-        if transcriber is not None:
+        # Záchranná síť pro cestu přes výjimku; při normálním běhu je model
+        # uvolněný už mezi průchody.
+        if transcriber is not None and not transcriber_unloaded:
             transcriber.unload()
+        if structurer is not None:
+            structurer.unload()
         fcntl.flock(lock, fcntl.LOCK_UN)
         lock.close()
 

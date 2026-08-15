@@ -85,14 +85,46 @@ worker:
 
     # Kam stahovat váhy modelu (výchozí je ~/.cache/huggingface).
     # download_root: ~/.cache/voicenotes-models
-# --- fáze 3 (zatím se nečte) -------------------------------------------
-#
-#   structure:
-#     backend: ollama            # ollama | anthropic
-#     tags: [napad, ukol, poznamka, otazka, prace, osobni]
-#     ollama:
-#       model: qwen3:8b
-#       host: http://127.0.0.1:11434
-#     anthropic:
-#       model: claude-sonnet-5
-#       api_key_env: ANTHROPIC_API_KEY
+  structure:
+    # false = poznámka má titulek z prvních slov přepisu a nic víc.
+    enabled: true
+
+    # Jediný klíč, kterým se přepíná mezi lokálním modelem a Claude API.
+    # Oba backendy dostanou stejný prompt i schéma, takže se dají porovnat
+    # na stejných datech.
+    backend: ollama # ollama | anthropic
+
+    # Uzavřený seznam tagů. Co model vrátí mimo něj, se zahodí — bez toho
+    # je za dva měsíce ve vaultu dvě stě unikátních tagů.
+    tags:
+      - napad
+      - ukol
+      - poznamka
+      - otazka
+      - prace
+      - osobni
+
+    # Strop na počet úkolů v jedné poznámce.
+    max_tasks: 10
+
+    ollama:
+      model: qwen3:8b
+      host: http://127.0.0.1:11434
+      num_ctx: 8192
+      temperature: 0.2
+      keep_alive: 5m # jak dlouho ollama drží model mezi dotazy
+      timeout_s: 180
+      connect_timeout_s: 5
+
+    anthropic:
+      model: claude-opus-5
+      # Klíč se čte z prostředí, v souboru je jen jméno proměnné.
+      api_key_env: ANTHROPIC_API_KEY
+      max_tokens: 2048
+      effort: low # krátká poznámka není náročná úloha
+      timeout_s: 120
+
+  review:
+    # Kolik dní smí poznámka ležet v inboxu, než se objeví v přehledu.
+    older_than_days: 7
+    filename_prefix: _review-

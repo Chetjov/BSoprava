@@ -230,11 +230,119 @@ class TranscribeConfig:
 
 
 @dataclass(frozen=True)
+class ReviewConfig:
+    """Fáze 4 — týdenní přehled poznámek, které leží v inboxu."""
+
+    older_than_days: int = 7
+    #: Prefix přehledů; podle něj se poznámky přehledů vynechávají ze scanu.
+    filename_prefix: str = "_review-"
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> ReviewConfig:
+        return cls(
+            older_than_days=int(data.get("older_than_days", 7)),
+            filename_prefix=str(data.get("filename_prefix", "_review-")),
+        )
+
+
+#: Uzavřený seznam tagů. Volné vymýšlení = dvě stě unikátních tagů za dva měsíce.
+DEFAULT_TAGS = ("napad", "ukol", "poznamka", "otazka", "prace", "osobni")
+
+
+@dataclass(frozen=True)
+class OllamaConfig:
+    model: str = "qwen3:8b"
+    host: str = "http://127.0.0.1:11434"
+    num_ctx: int = 8192
+    temperature: float = 0.2
+    #: Jak dlouho ollama drží model v paměti mezi dotazy během jednoho běhu.
+    keep_alive: str = "5m"
+    timeout_s: int = 180
+    connect_timeout_s: int = 5
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> OllamaConfig:
+        return cls(
+            model=str(data.get("model", "qwen3:8b")),
+            host=str(data.get("host", "http://127.0.0.1:11434")).rstrip("/"),
+            num_ctx=int(data.get("num_ctx", 8192)),
+            temperature=float(data.get("temperature", 0.2)),
+            keep_alive=str(data.get("keep_alive", "5m")),
+            timeout_s=int(data.get("timeout_s", 180)),
+            connect_timeout_s=int(data.get("connect_timeout_s", 5)),
+        )
+
+
+@dataclass(frozen=True)
+class AnthropicConfig:
+    model: str = "claude-opus-5"
+    api_key_env: str = "ANTHROPIC_API_KEY"
+    max_tokens: int = 2048
+    #: Krátká poznámka není náročná úloha; vyšší effort by jen platil za tokeny.
+    effort: str = "low"
+    timeout_s: int = 120
+
+    def api_key(self) -> str:
+        return os.environ.get(self.api_key_env, "")
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AnthropicConfig:
+        return cls(
+            model=str(data.get("model", "claude-opus-5")),
+            api_key_env=str(data.get("api_key_env", "ANTHROPIC_API_KEY")),
+            max_tokens=int(data.get("max_tokens", 2048)),
+            effort=str(data.get("effort", "low")),
+            timeout_s=int(data.get("timeout_s", 120)),
+        )
+
+
+@dataclass(frozen=True)
+class StructureConfig:
+    """Fáze 3 — titulek, shrnutí, tagy, úkoly."""
+
+    enabled: bool = True
+    backend: str = "ollama"
+    tags: tuple[str, ...] = DEFAULT_TAGS
+    max_tasks: int = 10
+    ollama: OllamaConfig = field(default_factory=OllamaConfig)
+    anthropic: AnthropicConfig = field(default_factory=AnthropicConfig)
+
+    @property
+    def model(self) -> str:
+        return self.anthropic.model if self.backend == "anthropic" else self.ollama.model
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> StructureConfig:
+        backend = str(data.get("backend", "ollama"))
+        if backend not in {"ollama", "anthropic"}:
+            raise ConfigError(
+                "config: worker.structure.backend musí být 'ollama' nebo 'anthropic'"
+            )
+        tags = data.get("tags")
+        if tags is None:
+            tags = list(DEFAULT_TAGS)
+        if not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags):
+            raise ConfigError("config: worker.structure.tags musí být seznam řetězců")
+        if not tags:
+            raise ConfigError("config: worker.structure.tags nesmí být prázdný seznam")
+        return cls(
+            enabled=bool(data.get("enabled", True)),
+            backend=backend,
+            tags=tuple(tags),
+            max_tasks=int(data.get("max_tasks", 10)),
+            ollama=OllamaConfig.from_dict(data.get("ollama") or {}),
+            anthropic=AnthropicConfig.from_dict(data.get("anthropic") or {}),
+        )
+
+
+@dataclass(frozen=True)
 class WorkerConfig:
     remote: RemoteConfig
     vault: VaultConfig
     work_dir: Path
     transcribe: TranscribeConfig = field(default_factory=TranscribeConfig)
+    structure: StructureConfig = field(default_factory=StructureConfig)
+    review: ReviewConfig = field(default_factory=ReviewConfig)
     timezone: str = "Europe/Prague"
     ffprobe_path: str = "ffprobe"
     rsync_path: str = "rsync"
@@ -265,6 +373,8 @@ class WorkerConfig:
             vault=VaultConfig.from_dict(_section(data, "vault")),
             work_dir=_expand(_require(data, "work_dir", "worker")),
             transcribe=TranscribeConfig.from_dict(data.get("transcribe") or {}),
+            structure=StructureConfig.from_dict(data.get("structure") or {}),
+            review=ReviewConfig.from_dict(data.get("review") or {}),
             timezone=str(data.get("timezone", "Europe/Prague")),
             ffprobe_path=str(data.get("ffprobe_path", "ffprobe")),
             rsync_path=str(data.get("rsync_path", "rsync")),

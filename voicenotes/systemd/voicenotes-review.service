@@ -1,0 +1,9 @@
+# ~/.config/systemd/user/voicenotes-review.service
+[Unit]
+Description=Týdenní přehled poznámek ležících v inboxu
+
+[Service]
+Type=oneshot
+Environment=VOICENOTES_CONFIG=%h/.config/voicenotes/config.yaml
+ExecStart=%h/.local/share/voicenotes/venv/bin/voicenotes-review
+TimeoutStartSec=10min

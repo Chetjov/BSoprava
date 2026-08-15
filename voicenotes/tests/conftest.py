@@ -11,6 +11,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from voicenotes.config import load_gateway_config, load_worker_config  # noqa: E402
+from voicenotes.worker.structure import Structure, Structurer  # noqa: E402
 from voicenotes.worker.transcribe import Transcriber, Transcript  # noqa: E402
 
 TOKEN = "test-token-123"
@@ -76,6 +77,7 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Env:
             "ffprobe_path": "ffprobe-neexistuje",
             # Testy transportu běží bez modelu; fáze 2 si přepisovač podstrčí.
             "transcribe": {"enabled": False},
+            "structure": {"enabled": False},
         },
     }
     config_path = tmp_path / "config.yaml"
@@ -154,3 +156,42 @@ def upload(client, data: bytes, *, token: str = TOKEN, filename: str = "rec.m4a"
         headers={"X-Auth-Token": token},
         files={"audio": (filename, data, "audio/m4a")},
     )
+
+
+class FakeStructurer(Structurer):
+    """Strukturování bez modelu — vrátí, co mu test nastaví."""
+
+    def __init__(
+        self,
+        outcome: Structure | Exception | None = None,
+        *,
+        model: str = "qwen3:8b",
+        available: bool = True,
+    ) -> None:
+        self.outcome = outcome or Structure(
+            title="Přepracovat retry logiku v importu",
+            summary="Import padá na timeoutu u velkých souborů.",
+            tags=["napad", "prace"],
+            tasks=["zvýšit timeout v importu"],
+            model=model,
+        )
+        self._model = model
+        self._available = available
+        self.calls: list[str] = []
+        self.unloaded = 0
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    def available(self) -> bool:
+        return self._available
+
+    def structure(self, transcript: str) -> Structure:
+        self.calls.append(transcript)
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return self.outcome
+
+    def unload(self) -> None:
+        self.unloaded += 1
