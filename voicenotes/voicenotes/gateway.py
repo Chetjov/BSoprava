@@ -146,6 +146,22 @@ def _error(status_code: int, detail: str) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"detail": detail})
 
 
+def _too_large(config: GatewayConfig, size: int | None) -> JSONResponse:
+    """Odmítnutá nahrávka zůstává v Diktafonu a telefon ji zkusí poslat znovu.
+
+    Bez záznamu v žurnálu by se taková nahrávka do vaultu nikdy nedostala
+    a nebylo by jak zjistit proč.
+    """
+    limit = config.max_upload_bytes
+    log.warning(
+        "odmítnuta nahrávka nad limit (%s B > %d B) — telefon ji bude zkoušet "
+        "znovu, dokud nezvýšíš gateway.max_upload_mb nebo ji nesmažeš",
+        size if size is not None else "?",
+        limit,
+    )
+    return _error(413, f"soubor je nad limit {limit} B")
+
+
 async def _read_form(request: Request, max_upload_bytes: int) -> Any:
     kwargs: dict[str, Any] = {}
     if "max_part_size" in _FORM_KWARGS:
@@ -196,16 +212,17 @@ def create_app(config: GatewayConfig) -> FastAPI:
         declared = request.headers.get("content-length")
         if declared and declared.isdigit():
             if int(declared) > config.max_upload_bytes + MULTIPART_SLACK:
-                return _error(413, f"soubor je nad limit {config.max_upload_bytes} B")
+                return _too_large(config, int(declared))
 
         try:
             form = await _read_form(request, config.max_upload_bytes)
         except MultiPartException:
-            return _error(413, f"soubor je nad limit {config.max_upload_bytes} B")
+            return _too_large(config, None)
 
         try:
             upload = form.get(FIELD_NAME)
             if not isinstance(upload, UploadFile):
+                log.warning("upload bez pole '%s' — odesílatel posílá něco jiného", FIELD_NAME)
                 return _error(400, f"chybí pole '{FIELD_NAME}' se souborem")
             return await _store(config, upload)
         finally:
@@ -226,13 +243,14 @@ async def _store(config: GatewayConfig, upload: UploadFile) -> JSONResponse:
             while chunk := await upload.read(READ_CHUNK):
                 size += len(chunk)
                 if size > config.max_upload_bytes:
-                    return _error(413, f"soubor je nad limit {config.max_upload_bytes} B")
+                    return _too_large(config, size)
                 digest.update(chunk)
                 sink.write(chunk)
             sink.flush()
             os.fsync(sink.fileno())
 
         if size == 0:
+            log.warning("odmítnut prázdný upload")
             return _error(400, "prázdný soubor")
 
         digest_hex = digest.hexdigest()

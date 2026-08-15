@@ -100,6 +100,7 @@ class NoteData:
     audio: str
     status: str = STATUS_INBOX
     duration_s: int | None = None
+    speech_s: int | None = None
     transcript_model: str | None = None
     structure_model: str | None = None
     tags: list[str] = field(default_factory=list)
@@ -113,6 +114,7 @@ class NoteData:
             "created": self.created.isoformat(timespec="seconds"),
             "source": "voice",
             "duration_s": self.duration_s,
+            "speech_s": self.speech_s,
             "audio": self.audio,
             "transcript_model": self.transcript_model,
             "structure_model": self.structure_model,

@@ -159,6 +159,7 @@ def build_note(
     note.transcript = transcript.text
     note.transcript_model = transcript.model
     note.duration_s = transcript.duration_s or note.duration_s
+    note.speech_s = transcript.speech_s
     return note
 
 

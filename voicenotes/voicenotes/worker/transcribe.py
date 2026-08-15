@@ -43,7 +43,11 @@ class Transcript:
     text: str
     model: str
     language: str | None = None
+    #: Celková délka nahrávky.
     duration_s: int | None = None
+    #: Délka řeči po ořezu VAD. Velký rozdíl proti `duration_s` znamená
+    #: hodně ticha v nahrávce a stojí za to se podívat proč.
+    speech_s: int | None = None
     segments: int = 0
 
 
@@ -139,11 +143,15 @@ class FasterWhisperTranscriber(Transcriber):
             raise NoSpeechFound(f"VAD nenašel řeč v {path.name}")
 
         duration = getattr(info, "duration", None)
+        # Bez VAD se nic neořezává a `duration_after_vad` je jen kopie
+        # celkové délky — takový údaj do frontmatteru nepatří.
+        speech = getattr(info, "duration_after_vad", None) if self.config.vad else None
         return Transcript(
             text=text,
             model=self.config.model,
             language=getattr(info, "language", None),
             duration_s=round(duration) if duration else None,
+            speech_s=round(speech) if speech else None,
             segments=len(texts),
         )
 
