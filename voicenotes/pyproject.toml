@@ -22,6 +22,7 @@ dev = ["pytest>=8.0", "httpx>=0.27", "fastapi>=0.110", "python-multipart>=0.0.9"
 [project.scripts]
 voicenotes-gateway = "voicenotes.gateway:main"
 voicenotes-worker = "voicenotes.worker.run:main"
+voicenotes-redo = "voicenotes.redo:main"
 voicenotes-review = "voicenotes.review:main"
 voicenotes-bench = "voicenotes.bench:main"
 

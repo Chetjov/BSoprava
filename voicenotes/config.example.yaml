@@ -74,6 +74,11 @@ worker:
     # Zabraňuje zacyklení na jedné frázi.
     condition_on_previous_text: false
 
+    # Kolikrát se přepis jedné nahrávky zkusí, než vznikne needs-review
+    # poznámka. Mezi pokusy je celý interval timeru, takže obsazená GPU
+    # nebo zaseknutý dekodér mají čas se srovnat. 1 = žádné opakování.
+    max_attempts: 3
+
     # Slovníček jmen a termínů, které model bez nápovědy komolí.
     initial_prompt_terms:
       - Obsidian

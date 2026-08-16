@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..config import ConfigError, WorkerConfig, load_worker_config
 from ..ids import TS_FORMAT, parse_id, sha256_file, slugify
+from .attempts import Attempts
 from .audio import probe_duration_s
 from .ledger import Ledger
 from .notes import (
@@ -72,13 +73,14 @@ class RunStats:
     created: int = 0
     skipped: int = 0
     rejected: int = 0
+    retried: int = 0
     failed: int = 0
 
     def as_line(self) -> str:
         return (
             f"staženo={self.fetched} poznámek={self.created} "
             f"přeskočeno={self.skipped} bez řeči={self.rejected} "
-            f"chyb={self.failed}"
+            f"na příště={self.retried} chyb={self.failed}"
         )
 
 
@@ -204,6 +206,7 @@ def transcribe_one(
     tzinfo: timezone | ZoneInfo,
     stats: RunStats,
     transcriber: Transcriber | None,
+    attempts: Attempts,
 ) -> Pending | None:
     """První průchod: ověřit soubor a přepsat ho.
 
@@ -268,8 +271,29 @@ def transcribe_one(
         stats.rejected += 1
         return None
     except TranscriptionFailed as exc:
-        log.error("přepis %s selhal: %s", name, exc)
+        attempt = attempts.bump(identifier)
+        limit = config.transcribe.max_attempts
+        if attempt < limit:
+            # Přechodná chyba (obsazená GPU, zaseknutý dekodér): nahrávka
+            # zůstává ve frontě na Pi a příští běh to zkusí znovu. Poznámka
+            # zatím nevzniká — pipeline poznámky needituje, takže needs-review
+            # z jednorázového výpadku by tam zůstal natrvalo.
+            log.warning(
+                "přepis %s selhal (pokus %d/%d), nechávám ve frontě: %s",
+                name,
+                attempt,
+                limit,
+                exc,
+            )
+            audio_path.unlink(missing_ok=True)
+            stats.retried += 1
+            return None
+        log.error("přepis %s selhal i po %d pokusech: %s", name, attempt, exc)
+        attempts.clear(identifier)
         pending.error = str(exc)
+        return pending
+
+    attempts.clear(identifier)
     return pending
 
 
@@ -388,6 +412,7 @@ def run(
             return stats
 
         ledger = Ledger(config.ledger_path)
+        attempts = Attempts(config.attempts_path)
         processed = ledger.processed_ids()
         tzinfo = resolve_timezone(config.timezone)
 
@@ -397,7 +422,15 @@ def run(
         for audio_path in files:
             try:
                 item = transcribe_one(
-                    config, remote, ledger, processed, audio_path, tzinfo, stats, transcriber
+                    config,
+                    remote,
+                    ledger,
+                    processed,
+                    audio_path,
+                    tzinfo,
+                    stats,
+                    transcriber,
+                    attempts,
                 )
             except TranscriberUnavailable:
                 # Systémová chyba: potkala by každou nahrávku. Radši zastavit

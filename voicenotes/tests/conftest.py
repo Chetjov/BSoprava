@@ -195,3 +195,14 @@ class FakeStructurer(Structurer):
 
     def unload(self) -> None:
         self.unloaded += 1
+
+
+def tweak_worker(env, **overrides) -> None:
+    """Přepíše klíče v sekci `worker:` v configu (mělké slučování sekcí)."""
+    data = yaml.safe_load(env.config_path.read_text(encoding="utf-8"))
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(data["worker"].get(key), dict):
+            data["worker"][key].update(value)
+        else:
+            data["worker"][key] = value
+    env.config_path.write_text(yaml.safe_dump(data), encoding="utf-8")

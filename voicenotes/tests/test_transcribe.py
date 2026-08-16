@@ -6,7 +6,7 @@ import hashlib
 from types import SimpleNamespace
 
 import pytest
-from conftest import FakeTranscriber, audio_bytes
+from conftest import FakeTranscriber, audio_bytes, tweak_worker
 
 from voicenotes.config import TranscribeConfig
 from voicenotes.worker import run as worker_run
@@ -149,8 +149,9 @@ def test_rejected_recording_is_recorded_in_the_ledger(env):
 
 
 def test_failed_transcription_still_creates_a_note(env):
-    """Poznámka vznikne s chybou v těle — tiše zmizet nesmí."""
+    """Po vyčerpání pokusů poznámka vznikne s chybou v těle — tiše zmizet nesmí."""
     name = queue_recording(env, audio_bytes())
+    tweak_worker(env, transcribe={"enabled": False, "max_attempts": 1})
     fake = FakeTranscriber(TranscriptionFailed("RuntimeError: CUDA out of memory"))
 
     stats = run(env.worker, transcriber=fake)
@@ -171,6 +172,7 @@ def test_failed_transcription_still_creates_a_note(env):
 def test_failed_transcription_does_not_block_the_others(env):
     good = queue_recording(env, audio_bytes(b"dobra"), when="2026-08-14T100000")
     bad = queue_recording(env, audio_bytes(b"spatna"), when="2026-08-14T110000")
+    tweak_worker(env, transcribe={"enabled": False, "max_attempts": 1})
     fake = FakeTranscriber(
         "Tahle nahrávka je v pořádku.",
         {bad: TranscriptionFailed("dekódování selhalo")},

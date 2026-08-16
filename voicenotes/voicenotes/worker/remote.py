@@ -40,6 +40,18 @@ class RemoteQueue(ABC):
     def reject(self, name: str) -> bool:
         """Přesune nahrávku bez řeči do `archive/rejected/<name>`."""
 
+    @abstractmethod
+    def find_archived(self, identifier: str) -> str | None:
+        """Najde archivovanou nahrávku podle ID — v `archive/` i `rejected/`.
+
+        Vrací celou vzdálenou cestu, protože ruční doběhnutí potřebuje vědět,
+        odkud soubor vzít (zahozené nahrávky leží jinde než zpracované).
+        """
+
+    @abstractmethod
+    def fetch_one(self, remote_path: str, destination: Path) -> Path:
+        """Stáhne jeden soubor do `destination` a vrátí lokální cestu."""
+
 
 class SshRemoteQueue(RemoteQueue):
     def __init__(
@@ -94,6 +106,45 @@ class SshRemoteQueue(RemoteQueue):
             f"if [ -e {queue_item} ]; then mv -f {queue_item} {archive_item}; fi"
         )
         return self.ssh_command() + [self.config.target, script]
+
+    def find_archived_command(self, identifier: str) -> list[str]:
+        archive = shlex.quote(str(self.config.archive_dir / identifier))
+        rejected = shlex.quote(str(self.config.rejected_dir / identifier))
+        # Prefix je v uvozovkách, hvězdička zůstává venku, ať ji rozbalí
+        # vzdálený shell. `identifier` je předem ověřený regexem.
+        script = f"ls -1 {archive}.* {rejected}.* 2>/dev/null | head -n 1"
+        return self.ssh_command() + [self.config.target, script]
+
+    def find_archived(self, identifier: str) -> str | None:
+        try:
+            result = self._run(
+                self.find_archived_command(identifier),
+                timeout=self.config.connect_timeout_s + 15,
+            )
+        except RemoteUnavailable as exc:
+            log.warning("hledání %s na Pi selhalo: %s", identifier, exc)
+            return None
+        found = result.stdout.strip().splitlines()
+        return found[0].strip() if found and found[0].strip() else None
+
+    def fetch_one(self, remote_path: str, destination: Path) -> Path:
+        destination.mkdir(parents=True, exist_ok=True)
+        command = [
+            self.rsync_path,
+            "-t",
+            "--protect-args",
+            f"--timeout={self.config.transfer_timeout_s}",
+            "-e",
+            shlex.join(self.ssh_command()),
+            f"{self.config.target}:{remote_path}",
+            f"{destination}/",
+        ]
+        result = self._run(command, timeout=self.config.transfer_timeout_s + 30)
+        if result.returncode != 0:
+            raise RemoteUnavailable(
+                f"rsync skončil s {result.returncode}: {result.stderr.strip()}"
+            )
+        return destination / Path(remote_path).name
 
     def _run(self, command: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
         log.debug("spouštím: %s", shlex.join(command))
@@ -165,7 +216,9 @@ class LocalRemoteQueue(RemoteQueue):
         self.config = config
 
     def is_available(self) -> bool:
-        return self.config.queue_dir.is_dir()
+        # Kořen, ne fronta: ruční doběhnutí sahá jen do archivu a ten může
+        # existovat i ve chvíli, kdy je fronta prázdná a smazaná.
+        return self.config.root.is_dir()
 
     def fetch_into(self, destination: Path) -> list[Path]:
         destination.mkdir(parents=True, exist_ok=True)
@@ -181,6 +234,20 @@ class LocalRemoteQueue(RemoteQueue):
 
     def reject(self, name: str) -> bool:
         return self._move(name, self.config.rejected_dir)
+
+    def find_archived(self, identifier: str) -> str | None:
+        for directory in (self.config.archive_dir, self.config.rejected_dir):
+            if not directory.is_dir():
+                continue
+            for candidate in sorted(directory.glob(f"{identifier}.*")):
+                return str(candidate)
+        return None
+
+    def fetch_one(self, remote_path: str, destination: Path) -> Path:
+        destination.mkdir(parents=True, exist_ok=True)
+        target = destination / Path(remote_path).name
+        shutil.copy2(remote_path, target)
+        return target
 
     def _move(self, name: str, destination: Path) -> bool:
         source = self.config.queue_dir / name

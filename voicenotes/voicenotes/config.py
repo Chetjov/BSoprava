@@ -195,6 +195,10 @@ class TranscribeConfig:
     initial_prompt_terms: tuple[str, ...] = ()
     initial_prompt_override: str | None = None
     download_root: Path | None = None
+    #: Kolikrát se přepis jedné nahrávky zkusí, než vznikne needs-review
+    #: poznámka. Mezi pokusy je celý interval timeru, takže obsazená GPU
+    #: nebo zaseknutý dekodér mají čas se srovnat. 1 = žádné opakování.
+    max_attempts: int = 3
 
     def build_initial_prompt(self) -> str | None:
         """Slovníček jmen a termínů, které model bez nápovědy komolí."""
@@ -226,6 +230,7 @@ class TranscribeConfig:
                 str(data["initial_prompt"]) if data.get("initial_prompt") else None
             ),
             download_root=_expand(download_root) if download_root else None,
+            max_attempts=max(1, int(data.get("max_attempts", 3))),
         )
 
 
@@ -361,6 +366,10 @@ class WorkerConfig:
     @property
     def ledger_path(self) -> Path:
         return self.state_dir / "processed.jsonl"
+
+    @property
+    def attempts_path(self) -> Path:
+        return self.state_dir / "attempts.json"
 
     @property
     def lock_path(self) -> Path:

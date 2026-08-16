@@ -160,8 +160,49 @@ Model se načítá až u první nahrávky — prázdná fronta na disk nesáhne 
 skončení běhu se uvolní z paměti. Na 6 GB VRAM se whisper a strukturovací
 model nevejdou zároveň — proto worker jede na dva průchody, viz níž.
 
-Ruční přepis jedné nahrávky (třeba po `needs-review`) zatím není zabalený do
-příkazu; audio zůstává v `archive/` na Pi, takže jde pustit whisper napřímo.
+### Opakování po přechodné chybě
+
+Obsazená GPU nebo zaseknutý dekodér nejsou důvod k trvalé `needs-review`
+poznámce — pipeline soubory ve vaultu needituje, takže by tam ta chyba
+zůstala navždy. Když přepis selže, nahrávka **zůstane ve frontě na Pi**,
+poznámka zatím nevzniká a příští běh to zkusí znovu:
+
+```
+běh 1: přepis selhal (pokus 1/3), nechávám ve frontě: CUDA out of memory
+běh 2: přepis selhal (pokus 2/3), nechávám ve frontě: CUDA out of memory
+běh 3: přepsáno (60 s, 1 segmentů) → poznámka se status: inbox
+```
+
+Mezi pokusy je celý interval timeru, takže má GPU čas se uvolnit. Po
+vyčerpání `transcribe.max_attempts` (výchozí 3) poznámka vznikne s chybou
+v těle, aby se nahrávka neztratila v nekonečné smyčce. `max_attempts: 1`
+vypne opakování úplně.
+
+Počítadlo pokusů je v `<work_dir>/state/attempts.json` — po úspěchu i po
+konečné poznámce se maže. Nahrávka zahozená VADem se neopakuje (to není
+přechodná chyba) a selhání strukturování taky ne — poznámka s přepisem je
+použitelná a opakování by stálo nový přepis.
+
+## Ruční doběhnutí
+
+Když poznámka skončí se `status: needs-review`, VAD nahrávku zahodil
+neprávem, nebo jen chceš vidět, co by z ní udělal jiný model:
+
+```bash
+voicenotes-redo 2026-08-14T143211-a3f9c1                    # znovu podle configu
+voicenotes-redo 2026-08-14T143211-a3f9c1 --no-vad           # VAD ji zahodil neprávem
+voicenotes-redo 2026-08-14T143211-a3f9c1 --model large-v3   # jiný whisper
+voicenotes-redo 2026-08-14T143211-a3f9c1 --backend anthropic
+voicenotes-redo 2026-08-14T143211-a3f9c1 --dry-run          # jen vypsat, nezapisovat
+```
+
+Nahrávka se stáhne z `archive/` nebo `archive/rejected/` na Pi, přepíše se
+znovu a vznikne **nová poznámka**. Původní zůstává — pipeline soubory ve
+vaultu needituje ani nemaže. Obě poznámky spojuje stejná cesta v `audio:`
+a obě mají řádek v evidenci, takže je poznat, která je novější.
+
+`--dry-run` vypíše poznámku na výstup a nic nezapíše. Vyplatí se: každé
+doběhnutí přidá do vaultu soubor, který ti nástroj sám nesmaže.
 
 ## Strukturování
 
@@ -221,9 +262,11 @@ Audio ve vaultu není a nebude; ve frontmatteru je jen cesta na Pi.
 | VAD nenajde řeč | Do `archive/rejected/`, poznámka nevzniká, log |
 | Přepis selže | Poznámka **vznikne** se `status: needs-review` a chybou v těle |
 | Model se nenačte | Běh se zastaví nenulovým kódem, fronta zůstane nedotčená |
+| Přechodná chyba přepisu | Nahrávka zůstane ve frontě, příští běh to zkusí znovu (3×) |
 | Strukturování selže | Poznámka vznikne s titulkem z prvních slov přepisu, `status: needs-review` |
 | LLM backend nedostupný | Ohlásí se jednou za běh, poznámky vzniknou bez strukturování |
 | Model vrátí tag mimo seznam | Tag se zahodí, poznámka vznikne |
+| Ruční doběhnutí | Vznikne nová poznámka, původní zůstane nedotčená |
 | Cílová poznámka existuje | Přidá se suffix `-2`, existující soubor se nikdy nepřepíše |
 | Zápis poznámky selže | Nahrávka zůstává ve frontě, další běh to zkusí znovu |
 | Dva běhy najednou | Druhý zjistí zámek a skončí |
@@ -337,7 +380,7 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev,gateway]'
 Testy jsou vážené na chybové stavy: atomický zápis, idempotence hashe, kolize
 názvů, špatný token, limit velikosti, nedostupné Pi, souběžné běhy, prázdná
 nahrávka, selhání přepisu, nenačtený model, rozbitá odpověď LLM, tagy mimo
-seznam, nedostupný backend. Happy path je jeden, přes celou cestu od uploadu
+seznam, nedostupný backend, opakování po přechodné chybě, ruční doběhnutí. Happy path je jeden, přes celou cestu od uploadu
 po soubor ve vaultu.
 
 Modely se v testech nahrazují — whisper falešným přepisovačem, ollama falešným
@@ -354,6 +397,7 @@ voicenotes/
 ├── ids.py         název souboru = timestamp + hash obsahu (sdílí obě strany)
 ├── gateway.py     celý HTTP endpoint pro Pi
 ├── bench.py       porovnání whisper modelů na vlastních nahrávkách
+├── redo.py        ruční doběhnutí jedné nahrávky z archivu
 ├── review.py      týdenní přehled poznámek ležících v inboxu
 └── worker/
     ├── run.py        hlavní běh: stáhnout, přepsat, zapsat, uklidit
@@ -363,6 +407,7 @@ voicenotes/
     ├── vault.py      zápis do vaultu — jen nové soubory, atomicky
     ├── notes.py      tvar markdown poznámky a frontmatteru
     ├── ledger.py     evidence zpracovaného (append-only JSONL, ne databáze)
+    ├── attempts.py   počítadlo pokusů o přepis, aby přechodná chyba nezůstala
     └── audio.py      délka nahrávky přes ffprobe
 ```
 
